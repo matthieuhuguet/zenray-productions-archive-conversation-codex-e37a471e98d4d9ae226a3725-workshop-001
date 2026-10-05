@@ -1,0 +1,314 @@
+// ZENRAY FREELANCE v2 (2026-09-12).
+//
+// A dashboard of studios: the ones still to contact, the ones already contacted with the exact
+// message that was sent, and a dated trail of every change, so the progress survives the months.
+// The look follows ZenRay Assets: one column, serif titles, cards, and a liquid glass pill for the
+// state. Storage is the drive file `freelance/applications.json`, written through the
+// read-modify-write helper so two tabs never lose a message.
+//
+// FR : le tableau de bord des studios, ceux a contacter et ceux deja contactes, avec le message
+// exact envoye et la trace datee de chaque changement. Meme esthetique que ZenRay Assets, meme
+// fichier de stockage qu'avant, ecrit sans jamais ecraser une modification concurrente.
+import React, { useEffect, useMemo, useState } from 'react'
+import { readJson, saveJsonWithRetry } from '../lib/saveJson.js'
+import { DOT } from '../config/colors.js'
+import { notify } from './Notifications.jsx'
+import FreelanceOfferDetails from './FreelanceOfferDetails.jsx'
+import {
+  STATUSES, normalizeStore, normalizeStudio, setStatus, addMessage, lastMessage, applyStudioChange,
+  groupByStatus, counts, timeline, searchStudios, readableDate, statusLabel, statusColor, isoDay,
+} from '../lib/freelanceStudios.js'
+
+const STORE_PATH = 'freelance/applications.json'
+
+// The parameter interface of the page: every value judged by eye lives here and nowhere else.
+// FR : l'interface de parametres de la page, toute valeur jugee a l'oeil vit ici.
+const P = {
+  serif: 'var(--zr-police-serif)',
+  sans: 'var(--zr-police-sans)',
+  mono: 'var(--zr-police-mono)',
+  serifWeight: 350,
+  numberWeight: 400,
+  column: 1240,
+  studioGrid: 'repeat(auto-fill, minmax(min(100%, 300px), 1fr))',
+  radius: 8,
+  cardPadding: '16px 18px',
+  gap: 14,
+  messageLines: 3,
+}
+
+const glassStyle = (t, color) => ({
+  display: 'inline-flex', alignItems: 'center', gap: DOT.gap,
+  padding: '4px 11px', borderRadius: 999,
+  background: (t.glass && t.glass.bg) || t.surface,
+  backdropFilter: (t.glass && t.glass.filter) || 'none',
+  WebkitBackdropFilter: (t.glass && t.glass.filter) || 'none',
+  boxShadow: (t.glass && t.glass.edge) || 'none',
+  border: `1px solid ${t.border}`,
+  color: t.textPrimary, fontFamily: P.sans, fontSize: 12.5, whiteSpace: 'nowrap',
+  ...(color ? { borderColor: color + '55' } : null),
+})
+
+function Dot({ color }) {
+  return <span aria-hidden="true" style={{ width: DOT.size, height: DOT.size, borderRadius: 999, background: color, flex: '0 0 auto' }} />
+}
+
+/** The liquid glass pill: the state of one studio, readable in one glance. */
+function GlassPill({ t, statusKey, children, onClick, active }) {
+  const color = statusColor(statusKey)
+  return (
+    <span onClick={onClick} style={{ ...glassStyle(t, color), cursor: onClick ? 'pointer' : 'default', opacity: active === false ? 0.55 : 1, fontWeight: active ? 600 : 400 }}>
+      <Dot color={color} />{children || statusLabel(statusKey)}
+    </span>
+  )
+}
+
+function Field({ t, value, onChange, placeholder, width = 180, onKeyDown }) {
+  return (
+    <input value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} onKeyDown={onKeyDown}
+      style={{ flex: `1 1 ${width}px`, minWidth: 120, background: t.surface, color: t.textPrimary, border: `1px solid ${t.border}`, borderRadius: P.radius, padding: '9px 12px', fontFamily: P.sans, fontSize: 13.5, outline: 'none' }} />
+  )
+}
+
+function Button({ t, onClick, children, primary }) {
+  return (
+    <button onClick={onClick} style={{ background: primary ? t.textPrimary : 'transparent', color: primary ? t.bg : t.textPrimary, border: primary ? 'none' : `1px solid ${t.border}`, borderRadius: P.radius, padding: '9px 15px', cursor: 'pointer', fontFamily: P.sans, fontSize: 13.5 }}>{children}</button>
+  )
+}
+
+function SectionTitle({ t, title, count }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, margin: '0 0 14px' }}>
+      <h3 style={{ fontFamily: P.serif, fontWeight: P.serifWeight, fontSize: 20, letterSpacing: '-0.015em', margin: 0 }}>{title}</h3>
+      <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 12.5, color: t.textSecondary }}>{count}</span>
+      <span style={{ flex: 1, height: 1, background: t.border }} />
+    </div>
+  )
+}
+
+/** One studio card: name, role, state pill, and the beginning of the last message sent. */
+function StudioCard({ t, studio, onOpen }) {
+  const msg = lastMessage(studio)
+  return (
+    <button type="button" onClick={onOpen} title={studio.name}
+      style={{ display: 'flex', flexDirection: 'column', gap: 8, textAlign: 'left', padding: P.cardPadding, border: `1px solid ${t.border}`, borderRadius: P.radius, background: t.surface, color: 'inherit', cursor: 'pointer', minWidth: 0 }}>
+      <span style={{ display: 'flex', alignItems: 'baseline', gap: 10, minWidth: 0 }}>
+        <span style={{ fontFamily: P.serif, fontWeight: P.serifWeight, fontSize: 18, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{studio.name}</span>
+        <span style={{ marginLeft: 'auto' }}><GlassPill t={t} statusKey={studio.status} /></span>
+      </span>
+      <span style={{ fontFamily: P.sans, fontSize: 12.5, color: t.textSecondary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        {[studio.role, studio.city].filter(Boolean).join(' · ') || 'poste à préciser'}
+      </span>
+      <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 11.5, color: t.textSecondary }}>
+        {studio.contactedAt ? `contacté le ${readableDate(studio.contactedAt)}` : 'jamais contacté'}
+        {studio.messages.length ? ` · ${studio.messages.length} message${studio.messages.length > 1 ? 's' : ''}` : ''}
+      </span>
+      {msg && (
+        <span style={{ fontFamily: P.sans, fontSize: 12, color: t.textSecondary, display: '-webkit-box', WebkitLineClamp: P.messageLines, WebkitBoxOrient: 'vertical', overflow: 'hidden', lineHeight: 1.45 }}>{msg.text}</span>
+      )}
+    </button>
+  )
+}
+
+/** One studio, opened in place: its messages, its dated history, its notes. */
+function StudioDetail({ t, studio, onBack, onChange, onDelete }) {
+  const [draft, setDraft] = useState('')
+  const [channel, setChannel] = useState('mail')
+  const [notes, setNotes] = useState(studio.notes)
+  useEffect(() => { setNotes(studio.notes) }, [studio.id])
+
+  const send = async () => {
+    if (!draft.trim()) return
+    if (!await onChange(addMessage(studio, { text: draft, channel }))) return
+    setDraft('')
+    notify({ title: 'Message enregistré', body: 'Le texte exact est gardé avec sa date.' })
+  }
+  const copy = (text) => { try { navigator.clipboard.writeText(text) } catch {} notify({ title: 'Message copié', body: 'Collé tel quel, prêt à envoyer.' }) }
+
+  const events = timeline([studio], 40)
+  return (
+    <>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 18, flexWrap: 'wrap' }}>
+        <button type="button" onClick={onBack} style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', color: t.textSecondary, fontFamily: P.sans, fontSize: 13 }}>← Tous les studios</button>
+        <span style={{ flex: 1 }} />
+        {studio.link && <a href={studio.link} target="_blank" rel="noreferrer" style={{ fontFamily: P.sans, fontSize: 12.5, color: t.textSecondary }}>site ou offre ↗</a>}
+        <button type="button" onClick={onDelete} style={{ background: 'none', border: 'none', cursor: 'pointer', color: t.textSecondary, fontFamily: P.sans, fontSize: 12.5 }}>supprimer</button>
+      </div>
+
+      <h2 style={{ fontFamily: P.serif, fontWeight: P.serifWeight, fontSize: 32, letterSpacing: '-0.02em', margin: '0 0 6px' }}>{studio.name}</h2>
+      <div style={{ fontFamily: P.sans, fontSize: 13.5, color: t.textSecondary, marginBottom: 16 }}>
+        {[studio.role, studio.city].filter(Boolean).join(' · ')}
+        {studio.contactedAt ? `${studio.role || studio.city ? ' · ' : ''}premier contact le ${readableDate(studio.contactedAt)}` : ''}
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 22 }}>
+        {STATUSES.map((s) => (
+          <GlassPill key={s.key} t={t} statusKey={s.key} active={studio.status === s.key}
+            onClick={() => onChange(setStatus(studio, s.key))} />
+        ))}
+      </div>
+
+      <FreelanceOfferDetails key={studio.id} path={studio.offerDetailsPath} t={t} />
+
+      <SectionTitle t={t} title="Messages envoyés" count={studio.messages.length} />
+      <div style={{ display: 'grid', gap: 10, marginBottom: 18 }}>
+        {studio.messages.slice().reverse().map((m, i) => (
+          <div key={`${m.at}-${i}`} style={{ border: `1px solid ${t.border}`, borderRadius: P.radius, background: t.surface, padding: P.cardPadding }}>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 6 }}>
+              <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 12.5, color: t.textSecondary }}>{readableDate(m.at)}</span>
+              <span style={{ fontFamily: P.sans, fontSize: 12, color: t.textSecondary }}>{m.channel}</span>
+              <button type="button" onClick={() => copy(m.text)} style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: t.textSecondary, fontFamily: P.sans, fontSize: 12 }}>copier</button>
+            </div>
+            <div style={{ fontFamily: P.sans, fontSize: 13, lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{m.text}</div>
+          </div>
+        ))}
+        {!studio.messages.length && <div style={{ fontFamily: P.sans, fontSize: 13, color: t.textSecondary }}>Aucun message pour l'instant. Colle ci-dessous celui que tu envoies, il sera gardé avec sa date.</div>}
+      </div>
+
+      <textarea value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="Le message envoyé, collé tel quel…"
+        style={{ width: '100%', background: t.surface, color: t.textPrimary, border: `1px solid ${t.border}`, borderRadius: P.radius, padding: 12, fontFamily: P.sans, fontSize: 13, minHeight: 120, resize: 'vertical', outline: 'none', boxSizing: 'border-box' }} />
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', margin: '10px 0 24px', flexWrap: 'wrap' }}>
+        {['mail', 'linkedin', 'instagram', 'discord', 'en personne'].map((c) => (
+          <span key={c} onClick={() => setChannel(c)} style={{ ...glassStyle(t), cursor: 'pointer', opacity: channel === c ? 1 : 0.55, fontWeight: channel === c ? 600 : 400 }}>{c}</span>
+        ))}
+        <span style={{ flex: 1 }} />
+        <Button t={t} primary onClick={send}>Enregistrer le message</Button>
+      </div>
+
+      <SectionTitle t={t} title="Historique" count={events.length} />
+      <div style={{ display: 'grid', gap: 6, marginBottom: 24 }}>
+        {events.map((e, i) => (
+          <div key={i} style={{ display: 'flex', gap: 10, alignItems: 'baseline', fontFamily: P.sans, fontSize: 12.5, color: t.textSecondary }}>
+            <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, minWidth: 128 }}>{readableDate(e.at)}</span>
+            <span>{e.label}</span>
+          </div>
+        ))}
+        {!events.length && <div style={{ fontFamily: P.sans, fontSize: 13, color: t.textSecondary }}>Rien encore.</div>}
+      </div>
+
+      <SectionTitle t={t} title="Notes" count="" />
+      <textarea value={notes} onChange={(e) => setNotes(e.target.value)} onBlur={() => { if (notes !== studio.notes) onChange({ ...studio, notes }) }}
+        placeholder="Contact, salaire, retour reçu…"
+        style={{ width: '100%', background: t.surface, color: t.textPrimary, border: `1px solid ${t.border}`, borderRadius: P.radius, padding: 12, fontFamily: P.sans, fontSize: 13, minHeight: 90, resize: 'vertical', outline: 'none', boxSizing: 'border-box' }} />
+    </>
+  )
+}
+
+export default function FreelanceView({ t }) {
+  const [store, setStore] = useState(null)
+  const [sha, setSha] = useState(null)
+  const [openId, setOpenId] = useState(null)
+  const [query, setQuery] = useState('')
+  const [filter, setFilter] = useState('all')
+  const [form, setForm] = useState({ name: '', role: '', link: '' })
+  const [saving, setSaving] = useState('')
+
+  useEffect(() => { let alive = true
+    readJson(STORE_PATH).then((r) => { if (!alive) return; setSha(r.sha); setStore(normalizeStore(r.data)) }).catch(() => { if (alive) setStore({ v: 2, studios: [] }) })
+    return () => { alive = false }
+  }, [])
+
+  // 30 September 2026, 19:45 Europe/Paris: Retry the intended change against the latest catalogue.
+  async function persist(mutate) {
+    setSaving('…')
+    try {
+      const r = await saveJsonWithRetry(STORE_PATH, (current) => mutate(normalizeStore(current)), { sha, data: store })
+      if (!r.ok) throw new Error(String(r.error || 'Enregistrement impossible'))
+      setSha(r.sha); setStore(normalizeStore(r.data)); setSaving('enregistré')
+      return true
+    } catch (error) {
+      setSaving('erreur'); notify({ title: 'Enregistrement impossible', body: error.message })
+      return false
+    }
+  }
+
+  const studios = store ? store.studios : []
+  const open = studios.find((s) => s.id === openId) || null
+  const shown = useMemo(() => {
+    const list = searchStudios(studios, query)
+    return filter === 'all' ? list : list.filter((s) => s.status === filter)
+  }, [studios, query, filter])
+  const c = counts(studios)
+  const events = useMemo(() => timeline(studios, 24), [studios])
+
+  const addStudio = () => {
+    const s = normalizeStudio({ ...form, createdAt: isoDay(), status: 'to_contact' })
+    if (!s) return
+    setForm({ name: '', role: '', link: '' })
+    persist((current) => ({ ...current, studios: [s, ...current.studios] }))
+  }
+  const updateStudio = (next) => persist((current) => applyStudioChange(current, studios.find((studio) => studio.id === next.id), next))
+  const removeStudio = (id) => { if (!window.confirm('Supprimer ce studio et son historique ?')) return; setOpenId(null); persist((current) => ({ ...current, studios: current.studios.filter((studio) => studio.id !== id) })) }
+
+  return (
+    <div style={{ maxWidth: P.column, margin: '0 auto', padding: '6px 2px 60px', color: t.textPrimary }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap', marginBottom: 6 }}>
+        <h1 style={{ fontFamily: P.serif, fontWeight: P.serifWeight, fontSize: 30, letterSpacing: '-0.02em', margin: 0 }}>ZenRay <span style={{ fontStyle: 'italic' }}>Freelance</span></h1>
+        <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, fontSize: 13, color: t.textSecondary }}>
+          {c.toContact} à contacter · {c.contacted} contactés · {c.answered} réponses · {c.messages} messages
+        </span>
+        <span style={{ marginLeft: 'auto', fontFamily: P.sans, fontSize: 12, color: t.textSecondary }}>{saving}</span>
+      </div>
+
+      {store === null && <div style={{ fontFamily: P.sans, fontSize: 13, color: t.textSecondary }}>chargement…</div>}
+
+      {store !== null && open && (
+        <StudioDetail t={t} studio={open} onBack={() => setOpenId(null)} onChange={updateStudio} onDelete={() => removeStudio(open.id)} />
+      )}
+
+      {store !== null && !open && (
+        <>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '16px 0 14px' }}>
+            <Field t={t} value={form.name} onChange={(v) => setForm({ ...form, name: v })} placeholder="Studio" onKeyDown={(e) => { if (e.key === 'Enter') addStudio() }} />
+            <Field t={t} value={form.role} onChange={(v) => setForm({ ...form, role: v })} placeholder="Poste visé" width={150} />
+            <Field t={t} value={form.link} onChange={(v) => setForm({ ...form, link: v })} placeholder="Site ou offre" width={200} />
+            <Button t={t} primary onClick={addStudio}>+ studio</Button>
+          </div>
+
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 22 }}>
+            <span onClick={() => setFilter('all')} style={{ ...glassStyle(t), cursor: 'pointer', opacity: filter === 'all' ? 1 : 0.55, fontWeight: filter === 'all' ? 600 : 400 }}>Tous {studios.length}</span>
+            {groupByStatus(studios).map((g) => (
+              <GlassPill key={g.key} t={t} statusKey={g.key} active={filter === g.key} onClick={() => setFilter(filter === g.key ? 'all' : g.key)}>
+                {g.label} {g.items.length}
+              </GlassPill>
+            ))}
+            <span style={{ flex: 1, minWidth: 140 }}>
+              <Field t={t} value={query} onChange={setQuery} placeholder="Chercher un studio, un message…" width={200} />
+            </span>
+          </div>
+
+          {groupByStatus(shown).map((g) => (
+            <div key={g.key} style={{ marginBottom: 26 }}>
+              <SectionTitle t={t} title={g.label} count={g.items.length} />
+              <div style={{ display: 'grid', gridTemplateColumns: P.studioGrid, gap: P.gap }}>
+                {g.items.map((s) => <StudioCard key={s.id} t={t} studio={s} onOpen={() => setOpenId(s.id)} />)}
+              </div>
+            </div>
+          ))}
+
+          {!studios.length && (
+            <div style={{ fontFamily: P.sans, fontSize: 13.5, color: t.textSecondary, lineHeight: 1.6 }}>
+              Aucun studio pour l'instant. Ajoute le premier ci-dessus, puis colle le message que tu lui envoies :
+              la date, le texte et chaque changement d'état resteront gardés.
+            </div>
+          )}
+
+          {events.length > 0 && (
+            <div style={{ marginTop: 34 }}>
+              <SectionTitle t={t} title="Progression" count={events.length} />
+              <div style={{ display: 'grid', gap: 6 }}>
+                {events.map((e, i) => (
+                  <div key={i} onClick={() => setOpenId(e.id)} style={{ display: 'flex', gap: 10, alignItems: 'baseline', cursor: 'pointer', fontFamily: P.sans, fontSize: 12.5, color: t.textSecondary }}>
+                    <span style={{ fontFamily: P.serif, fontWeight: P.numberWeight, minWidth: 128 }}>{readableDate(e.at)}</span>
+                    <span style={{ color: t.textPrimary }}>{e.studio}</span>
+                    <span>{e.label}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}

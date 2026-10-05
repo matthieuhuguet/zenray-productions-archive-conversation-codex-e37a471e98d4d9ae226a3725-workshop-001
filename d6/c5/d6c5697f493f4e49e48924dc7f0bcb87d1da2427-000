@@ -1,0 +1,23 @@
+import { describe, expect, it } from 'vitest'
+import { buildTree, entriesOf } from './buildNodes.js'
+
+describe('Eagle folder placements in the Create tree', () => {
+  it('materialise le placement comme dossier et masque le marqueur', () => {
+    const paths = ['pages/Projet/Character/.zreagle-folder.json']
+    const entries = entriesOf(paths, 'pages/Projet')
+    expect(entries).toEqual([expect.objectContaining({ name: 'Character', dir: 'pages/Projet/Character', contentPath: null, type: 'folder' })])
+    expect(entries.some((entry) => entry.name === '.zreagle-folder.json')).toBe(false)
+  })
+
+  it('fusionne les enfants logiques renvoyés par le serveur sous le placement', () => {
+    const tree = buildTree([
+      'pages/Projet/Character/.zreagle-folder.json',
+      'pages/Projet/Character/model.fbx.file.json',
+      'pages/Projet/Character/textures/albedo.img.json',
+    ])
+    const character = tree.children.Projet.children.Character
+    expect(character.contentPath).toBeNull()
+    expect(character.children['model.fbx'].contentPath).toBe('pages/Projet/Character/model.fbx.file.json')
+    expect(character.children.textures.children.albedo.contentPath).toBe('pages/Projet/Character/textures/albedo.img.json')
+  })
+})

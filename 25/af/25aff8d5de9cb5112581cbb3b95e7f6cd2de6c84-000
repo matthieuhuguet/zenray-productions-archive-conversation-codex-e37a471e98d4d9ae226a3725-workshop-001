@@ -1,0 +1,48 @@
+import { useEffect, useRef, useState } from 'react'
+
+// Families libass may ask for. One definition, used by every player.
+export const SUB_FONTS = { 'liberation sans': '/jassub/default.woff2', 'inter variable': '/fonts/InterVariable.woff2', inter: '/fonts/InterVariable.woff2' }
+
+// track = { format:'vtt'|'ass'|'ssa', src } | null. videoRef = ref vers le <video>.
+export default function SubtitleLayer({ videoRef, track }) {
+  const jassubRef = useRef(null)
+  const trackElRef = useRef(null)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    const video = videoRef.current
+    let cancelled = false
+    // Dispose the previous renderer without cancelling this new effect run.
+    if (jassubRef.current) { try { jassubRef.current.destroy() } catch {} jassubRef.current = null }
+    if (trackElRef.current) { try { trackElRef.current.remove() } catch {} trackElRef.current = null }
+    const cleanup = () => {
+      cancelled = true
+      if (jassubRef.current) { try { jassubRef.current.destroy() } catch {} jassubRef.current = null }
+      if (trackElRef.current) { try { trackElRef.current.remove() } catch {} trackElRef.current = null }
+    }
+    setError('')
+    if (!video || !track) return cleanup
+    ;(async () => {
+      if (track.format === 'ass' || track.format === 'ssa') {
+        const { default: JASSUB } = await import('jassub')
+        const subContent = await (await fetch(track.src)).text()
+        if (cancelled) return
+        // 2026-09-30: Inter is the site font AND the dialogue font of the restyled ASS tracks. libass (the same
+        // library VLC uses, compiled to WebAssembly by JASSUB) resolves a family by its lowercase key.
+        // FR : Inter est la police du site et celle des dialogues ; libass la resout par son nom en minuscules.
+        jassubRef.current = new JASSUB({ video, subContent, workerUrl: '/jassub/jassub-worker.js', wasmUrl: '/jassub/jassub-worker.wasm', fonts: ['/jassub/default.woff2'], availableFonts: SUB_FONTS })
+      } else {
+        const el = document.createElement('track')
+        el.kind = 'subtitles'; el.src = track.src; el.default = true
+        video.appendChild(el)
+        try { el.track.mode = 'showing' } catch {}
+        trackElRef.current = el
+      }
+    })().catch((reason) => {
+      if (!cancelled) setError(`Sous-titres indisponibles${reason?.message ? ` · ${reason.message}` : ''}`)
+    })
+    return cleanup
+  }, [track, videoRef])
+
+  return error ? <div role="status" style={{ position: 'absolute', left: 12, bottom: 58, zIndex: 35, maxWidth: 'calc(100% - 24px)', padding: '6px 10px', borderRadius: 999, background: 'rgba(20,20,22,.72)', color: '#fff', fontSize: 'var(--zr-ui-xs)', pointerEvents: 'none' }}>{error}</div> : null
+}

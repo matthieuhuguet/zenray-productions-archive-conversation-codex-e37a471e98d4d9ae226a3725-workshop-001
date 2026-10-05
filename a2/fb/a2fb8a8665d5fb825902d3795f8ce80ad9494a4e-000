@@ -1,0 +1,302 @@
+// 3 October 2026, 03:25 CEST: watcher recovery notices must reflect a live failure, never an old cloud snapshot.
+import React from 'react'
+import { afterEach, expect, it, vi } from 'vitest'
+import { render, screen, cleanup, fireEvent, within } from '@testing-library/react'
+import ProjectWorkspace from './ProjectWorkspace.jsx'
+
+afterEach(cleanup)
+
+// 3 October 2026, 16:05 CEST: conversations remain accessible without flooding the project shelf.
+it('separates standalone conversations from projects', () => {
+  const projects = [{ id: 'tiles', name: 'Tiles', files: [] }, { id: 'discussion', name: 'Research discussion', category: 'Conversations', files: [] }]
+  render(<ProjectWorkspace projects={projects} activeProjectId="tiles" />)
+  expect(screen.queryByRole('button', { name: /Research discussion/ })).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: /Conversations 1/ }))
+  expect(screen.getByRole('button', { name: /Research discussion/ })).toBeDefined()
+  expect(screen.queryByRole('button', { name: /^Tiles/ })).toBeNull()
+})
+
+// 3 October 2026, 09:48 CEST: an active partial copy can receive the exact selected files through its existing LOAD action.
+it('offers completing the active copy with the selected archived file', () => {
+  const file = { id: 'workshop:New.png', relativePath: 'New.png', cloudPath: 'pages/test/New.png.file.json', status: 'backed-up' }
+  const project = { id: 'test-project', name: 'Test project', files: [file], workspace: { state: 'loaded', path: '/copies/active' } }
+  const onLoad = vi.fn()
+  const { rerender } = render(<ProjectWorkspace projects={[project]} activeProjectId={project.id} bridgeConnected onLoad={onLoad} />)
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Sélectionner New.png' }))
+  const button = screen.getByRole('button', { name: 'Compléter la copie' })
+  expect(button.disabled).toBe(false)
+  fireEvent.click(button)
+  expect(onLoad.mock.calls[0][0]).toEqual(project)
+  expect(onLoad.mock.calls[0][1].map((entry) => entry.id)).toEqual([file.id])
+  rerender(<ProjectWorkspace projects={[project]} activeProjectId={project.id} bridgeConnected={false} onLoad={onLoad} />)
+  expect(screen.getByRole('button', { name: 'Compléter la copie' }).disabled).toBe(true)
+})
+
+// 3 October 2026, 09:20 CEST: resource checks require an active scene copy and distinguish historical evidence from current applicability.
+it('runs an exact loaded scene check and disables it for original files or disconnected Macs', () => {
+  const scene = { sceneFileId: 'production:Scene.hiplc', state: 'current', references: [] }
+  const file = { id: scene.sceneFileId, relativePath: 'Scene.hiplc', status: 'verified', loadedCopy: true }
+  const project = { id: 'test-project', name: 'Test project', files: [file], sceneReferences: [scene] }
+  const onPrepareScene = vi.fn()
+  const { rerender } = render(<ProjectWorkspace projects={[project]} activeProjectId={project.id} bridgeConnected onPrepareScene={onPrepareScene} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Emplacements' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Vérifier les ressources chargées' }))
+  expect(onPrepareScene).toHaveBeenCalledWith(project, scene)
+  rerender(<ProjectWorkspace projects={[project]} activeProjectId={project.id} bridgeConnected={false} onPrepareScene={onPrepareScene} />)
+  expect(screen.getByRole('button', { name: 'Vérifier les ressources chargées' }).disabled).toBe(true)
+  rerender(<ProjectWorkspace projects={[{ ...project, files: [{ ...file, loadedCopy: false }] }]} activeProjectId={project.id} bridgeConnected onPrepareScene={onPrepareScene} />)
+  expect(screen.getByRole('button', { name: 'Vérifier les ressources chargées' }).disabled).toBe(true)
+})
+
+it('shows resource preparation proof without claiming a saved or rendered scene', () => {
+  const preparation = { state: 'verified', checkedAt: '2026-10-03T07:20:00Z', inputCount: 20, libraryCount: 7, instanceCount: 16, warningCount: 0, diagnosticCount: 6 }
+  const scene = { sceneFileId: 'production:Scene.hiplc', state: 'current', references: [], preparation }
+  const project = { id: 'test-project', name: 'Test project', files: [], sceneReferences: [scene] }
+  const { rerender } = render(<ProjectWorkspace projects={[project]} activeProjectId={project.id} bridgeConnected />)
+  fireEvent.click(screen.getByRole('button', { name: 'Emplacements' }))
+  expect(screen.getByText(/Reconnexion vérifiée/).textContent).toContain('pour les copies actuelles')
+  expect(screen.getByText(/entrées ·/).textContent).toContain('20 entrées · 7 bibliothèques · 16 instances')
+  expect(screen.getByText('Le contrôle comporte des diagnostics conservés dans la preuve locale.')).toBeDefined()
+  expect(screen.getByText('Le fonctionnement de la scène après rechargement reste à vérifier.')).toBeDefined()
+  rerender(<ProjectWorkspace projects={[project]} activeProjectId={project.id} bridgeConnected={false} />)
+  expect(screen.getByText(/Reconnexion vérifiée/).textContent).not.toContain('pour les copies actuelles')
+  rerender(<ProjectWorkspace projects={[{ ...project, sceneReferences: [{ ...scene, preparation: { ...preparation, state: 'stale' } }] }]} activeProjectId={project.id} bridgeConnected />)
+  expect(screen.getByText('La copie ou une ressource a changé. La vérification est à refaire.')).toBeDefined()
+})
+
+it.each([
+  ['watchError', 'Le suivi d’un emplacement attend son rétablissement. Reconnexion automatique en cours.'],
+  ['feedbackError', 'La collecte automatique des prompts rencontre une erreur. Certaines sessions attendent une vérification.'],
+  ['sceneAuditError', 'L’analyse des ressources d’une scène attend une nouvelle tentative automatique. Le suivi des fichiers continue.'],
+])('shows a live %s failure and clears it after recovery or disconnection', (key, text) => {
+  const project = { id: 'test-project', name: 'Test project', sources: [], files: [], sync: { watched: true, [key]: 'source unavailable' } }
+  const { rerender } = render(<ProjectWorkspace projects={[project]} activeProjectId={project.id} bridgeConnected />)
+  expect(screen.getByText(text)).toBeDefined()
+  rerender(<ProjectWorkspace projects={[project]} activeProjectId={project.id} bridgeConnected={false} />)
+  expect(screen.queryByText(text)).toBeNull()
+  rerender(<ProjectWorkspace projects={[{ ...project, sync: { watched: true, [key]: null } }]} activeProjectId={project.id} bridgeConnected />)
+  expect(screen.queryByText(text)).toBeNull()
+})
+
+// 3 October 2026, 03:45 CEST: the page guides new files to the active TMP rather than the LOAD root.
+it('shows the tracked workshop and opens it only while the Mac is connected', () => {
+  const project = { id: 'test-project', name: 'Test project', sources: [{ id: 'workshop', namespace: 'tmp', localPath: '/TMP/project' }], files: [], jobs: [{ type: 'archive', state: 'running' }], workspace: { state: 'loaded', path: '/LOAD/project' } }
+  const onOpenWorkshop = vi.fn()
+  const { rerender } = render(<ProjectWorkspace projects={[project]} activeProjectId={project.id} bridgeConnected onOpenWorkshop={onOpenWorkshop} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Emplacements' }))
+  expect(screen.getAllByText('/LOAD/project/sources/tmp/workshop')).toHaveLength(2)
+  fireEvent.click(screen.getByRole('button', { name: 'Ouvrir l’atelier' }))
+  expect(onOpenWorkshop).toHaveBeenCalledWith(project)
+  rerender(<ProjectWorkspace projects={[project]} activeProjectId={project.id} bridgeConnected={false} onOpenWorkshop={onOpenWorkshop} />)
+  expect(screen.getByRole('button', { name: 'Ouvrir l’atelier' }).disabled).toBe(true)
+})
+
+// 3 October 2026, 04:32 CEST: repeated references count one file and navigation selects its exact inventoried identity.
+it('shows unique scene files, unresolved references and navigates to a local resource', () => {
+  const target = { projectId: 'test-project', fileId: 'textures:wood.png', relativePath: 'wood.png', status: 'backed-up' }
+  const project = { id: 'test-project', name: 'Test project', sources: [], files: [{ id: target.fileId, relativePath: target.relativePath, status: target.status }],
+    sceneReferences: [{ sceneFileId: 'production:Scene.hiplc', state: 'current', references: [
+      { referenceId: 0, type: 'mapped', targets: [target] }, { referenceId: 1, type: 'mapped', targets: [target] },
+      { referenceId: 2, parameterPath: '/obj/mesh/file', type: 'unresolved' },
+    ] }] }
+  render(<ProjectWorkspace projects={[project]} activeProjectId={project.id} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Emplacements' }))
+  expect(screen.getByText('Scene.hiplc').parentElement.textContent).toContain('1 fichier identifié')
+  expect(screen.getByText('Le fonctionnement de la scène après rechargement reste à vérifier.')).toBeDefined()
+  expect(screen.getByText('Un chemin non identifié ne prouve pas qu’un fichier manque.')).toBeDefined()
+  fireEvent.click(screen.getByRole('button', { name: 'wood.png' }))
+  expect(screen.getByRole('checkbox', { name: 'Sélectionner wood.png' }).checked).toBe(true)
+  expect(screen.getByRole('table', { name: 'Liste des fichiers' })).toBeDefined()
+})
+
+// 3 October 2026, 04:32 CEST: a shared resource opens its host and waits for that project's files before selection.
+it('navigates a shared scene resource to the exact file in its host project', () => {
+  const target = { projectId: 'shared-houdini', fileId: 'library:Roof.hda', relativePath: 'Roof.hda', status: 'backed-up' }
+  const host = { id: target.projectId, name: 'Bibliothèque Houdini', files: [{ id: target.fileId, relativePath: target.relativePath, status: target.status }] }
+  const project = { id: 'test-project', name: 'Test project', dependencies: [host.id], files: [], sceneReferences: [{ sceneFileId: 'production:Scene.hiplc', state: 'current', references: [{ type: 'mapped', targets: [target] }] }] }
+  const onSelectProject = vi.fn()
+  const { rerender } = render(<ProjectWorkspace projects={[project, host]} activeProjectId={project.id} onSelectProject={onSelectProject} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Emplacements' }))
+  expect(screen.getByRole('button', { name: 'Voir le projet hôte' })).toBeDefined()
+  fireEvent.click(screen.getByRole('button', { name: 'Roof.hda' }))
+  expect(onSelectProject).toHaveBeenCalledWith(host.id)
+  rerender(<ProjectWorkspace projects={[project, host]} activeProjectId={host.id} onSelectProject={onSelectProject} />)
+  expect(screen.getByRole('checkbox', { name: 'Sélectionner Roof.hda' }).checked).toBe(true)
+})
+
+// 3 October 2026, 04:32 CEST: stale analysis never presents old resource links as current evidence.
+it('shows stale scene analysis without offering its previous resource links', () => {
+  const project = { id: 'test-project', name: 'Test project', files: [], sceneReferences: [{ sceneFileId: 'production:Scene.hiplc', state: 'stale', references: [{ type: 'mapped', targets: [{ projectId: 'test-project', fileId: 'texture:old.png', relativePath: 'old.png' }] }] }] }
+  render(<ProjectWorkspace projects={[project]} activeProjectId={project.id} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Emplacements' }))
+  expect(screen.getByText('Analyse périmée')).toBeDefined()
+  expect(screen.queryByRole('button', { name: 'old.png' })).toBeNull()
+})
+
+// 3 October 2026, 04:51 CEST: first analysis has a visible live state before any scene context exists.
+it('shows outstanding automatic scene analyses and removes their live state after completion or disconnection', () => {
+  const project = { id: 'test-project', name: 'Test project', files: [], sync: { sceneAuditPendingCount: 2 } }
+  const { rerender } = render(<ProjectWorkspace projects={[project]} activeProjectId={project.id} bridgeConnected />)
+  fireEvent.click(screen.getByRole('button', { name: 'Emplacements' }))
+  expect(screen.getByText(/scènes en cours ou en attente/).textContent).toContain('2 scènes')
+  rerender(<ProjectWorkspace projects={[project]} activeProjectId={project.id} bridgeConnected={false} />)
+  expect(screen.queryByText(/scènes en cours ou en attente/)).toBeNull()
+  rerender(<ProjectWorkspace projects={[{ ...project, sync: { sceneAuditPendingCount: 0 } }]} activeProjectId={project.id} bridgeConnected />)
+  expect(screen.queryByText(/scènes en cours ou en attente/)).toBeNull()
+})
+
+// 3 October 2026, 05:03 CEST: a restored resource is identified but remains visibly disconnected from an old scene path.
+it('distinguishes an identified restored resource from a scene path that still needs reconnection', () => {
+  const target = { projectId: 'test-project', fileId: 'textures:color.png', relativePath: 'color.png', status: 'verified' }
+  const project = { id: 'test-project', name: 'Test project', files: [], sceneReferences: [{ sceneFileId: 'production:Scene.hiplc', state: 'current', references: [{ referenceId: 0, parameterPath: '/obj/mesh/file', type: 'relocation-required', targets: [target] }] }] }
+  render(<ProjectWorkspace projects={[project]} activeProjectId={project.id} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Emplacements' }))
+  expect(screen.getByText('Scene.hiplc').parentElement.textContent).toContain('1 fichier identifié')
+  expect(screen.getByRole('button', { name: 'color.png' })).toBeDefined()
+  expect(screen.getByText('À reconnecter à la copie chargée')).toBeDefined()
+  expect(screen.getByText('Le fonctionnement de la scène après rechargement reste à vérifier.')).toBeDefined()
+})
+
+// 3 October 2026, 10:09 CEST: origin conflicts remain visible only with current evidence from the connected Mac.
+it('warns about two local versions and clears the live warning off the Mac', () => {
+  const project = { id: 'test-project', name: 'Test project', files: [], sync: { sourceConflictCount: 1 } }
+  const { rerender } = render(<ProjectWorkspace projects={[project]} activeProjectId={project.id} bridgeConnected />)
+  expect(screen.getByRole('alert').textContent).toContain('en deux versions différentes')
+  rerender(<ProjectWorkspace projects={[project]} activeProjectId={project.id} bridgeConnected={false} />)
+  expect(screen.queryByRole('alert')).toBeNull()
+})
+
+it('identifies the exact file with two versions while keeping its archive byte status separate', () => {
+  const project = { id: 'test-project', name: 'Test project', files: [{ id: 'scene:Scene.hiplc', relativePath: 'Scene.hiplc', status: 'verified', sourceConflict: { originalSha256: 'a', copySha256: 'b' } }], sync: { sourceConflictCount: 1 } }
+  const { rerender } = render(<ProjectWorkspace projects={[project]} activeProjectId={project.id} bridgeConnected />)
+  expect(screen.getByRole('checkbox', { name: 'Sélectionner Scene.hiplc' })).toBeDefined()
+  expect(screen.getAllByText('Deux versions').length).toBeGreaterThan(0)
+  fireEvent.change(screen.getByRole('combobox', { name: 'État des fichiers' }), { target: { value: 'pending' } })
+  expect(screen.getByRole('checkbox', { name: 'Sélectionner Scene.hiplc' })).toBeDefined()
+  rerender(<ProjectWorkspace projects={[project]} activeProjectId={project.id} bridgeConnected={false} />)
+  expect(screen.queryByRole('checkbox', { name: 'Sélectionner Scene.hiplc' })).toBeNull()
+})
+
+// 3 October 2026, 15:10 CEST: the visible identity uses the existing mapping and keeps local paths out of a cloud-only projection.
+it('exposes an individual Markdown identity with source and cloud paths', () => {
+  const project = { id: 'identity-demo', name: 'Identity demo', folder: 'pages/ZenRayAssets/identity-demo', sources: [{ id: 'workshop', namespace: 'tmp', localPath: '/work/identity-demo' }], feedbackPath: '/memory/identity-demo/FEEDBACK.md', files: [] }
+  const { rerender } = render(<ProjectWorkspace projects={[project]} bridgeConnected />)
+  fireEvent.click(screen.getByRole('button', { name: 'Emplacements' }))
+  const identity = screen.getByRole('region', { name: 'Identité du projet' })
+  expect(identity.textContent).toContain('identity-demo')
+  expect(identity.querySelector('pre').textContent).toContain('/work/identity-demo')
+  expect(identity.querySelector('pre').textContent).toContain('pages/ZenRayAssets/identity-demo/sources/tmp/workshop')
+  expect(screen.getByRole('button', { name: 'Télécharger la fiche .md' })).toBeDefined()
+  rerender(<ProjectWorkspace projects={[{ ...project, sources: [{ id: 'workshop', namespace: 'tmp' }], feedbackPath: null }]} bridgeConnected={false} />)
+  expect(screen.getByRole('region', { name: 'Identité du projet' }).querySelector('pre').textContent).not.toContain('/work/')
+})
+
+// 3 October 2026, 15:04 CEST: copy destinations do not overwrite registered origins or imply cloud verification.
+it('labels production, loaded copy and cloud destination separately and copies the exact path', async () => {
+  const writeText = vi.fn().mockResolvedValue(undefined)
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+  const project = { id: 'mapping-demo', name: 'Mapping', folder: 'pages/ZenRayAssets/mapping-demo', sources: [{ id: 'workshop', namespace: 'tmp', localPath: '/original/a space' }], workspace: { state: 'loaded', path: '/managed/load' }, files: [] }
+  render(<ProjectWorkspace projects={[project]} bridgeConnected />)
+  fireEvent.click(screen.getByRole('button', { name: 'Emplacements' }))
+  expect(screen.getByText('Source sur ce Mac')).toBeDefined()
+  expect(screen.getByText('Copie de travail')).toBeDefined()
+  expect(screen.getByText('Destination cloud')).toBeDefined()
+  fireEvent.click(screen.getByRole('button', { name: 'Copier Source sur ce Mac' }))
+  expect(writeText).toHaveBeenCalledWith('/original/a space')
+  expect(await screen.findByText('Chemin copié')).toBeDefined()
+})
+
+// 3 October 2026, 15:08 CEST: visible rows reflect composed filters and a second sort click reverses the order.
+it('combines extension and name filters and reverses chronological ordering', () => {
+  const files = [{ id: 'a', name: 'tile2.png', relativePath: 'tile2.png', kind: 'image', size: 10, mtimeMs: 1000 }, { id: 'b', name: 'tile10.png', relativePath: 'tile10.png', kind: 'image', size: 20, mtimeMs: 2000 }, { id: 'c', name: 'notes.md', relativePath: 'notes.md', kind: 'text' }]
+  render(<ProjectWorkspace projects={[{ id: 'filters-demo', name: 'Filters', files }]} />)
+  fireEvent.change(screen.getByRole('combobox', { name: 'Extension de fichier' }), { target: { value: 'png' } })
+  expect(screen.queryByRole('checkbox', { name: 'Sélectionner notes.md' })).toBeNull()
+  fireEvent.change(screen.getByRole('combobox', { name: 'Trier par' }), { target: { value: 'date' } })
+  expect(screen.getAllByRole('row')[1].textContent).toContain('tile2.png')
+  fireEvent.click(screen.getByRole('button', { name: 'Inverser le tri' }))
+  expect(screen.getAllByRole('row')[1].textContent).toContain('tile10.png')
+  fireEvent.change(screen.getByRole('textbox', { name: 'Rechercher un fichier' }), { target: { value: 'tile2' } })
+  expect(screen.queryByRole('checkbox', { name: 'Sélectionner tile10.png' })).toBeNull()
+})
+
+// 3 October 2026, 15:09 CEST: switching layouts preserves selected identity and columns navigate real nested paths.
+it('keeps selection across icons, gallery and navigable source columns', () => {
+  const file = { id: 'workshop:refs/a.png', sourceId: 'workshop', namespace: 'tmp', name: 'a.png', relativePath: 'refs/a.png', kind: 'image', size: 15 }
+  const onPreview = vi.fn()
+  render(<ProjectWorkspace projects={[{ id: 'layouts', name: 'Layouts', files: [file] }]} onPreview={onPreview} />)
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Sélectionner a.png' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Icônes', exact: true }))
+  expect(screen.getByRole('checkbox', { name: 'Sélectionner a.png' }).checked).toBe(true)
+  fireEvent.click(screen.getByRole('button', { name: 'Galerie', exact: true }))
+  fireEvent.click(screen.getByRole('button', { name: 'Grand aperçu de a.png' }))
+  expect(onPreview.mock.calls[0][0].id).toBe(file.id)
+  fireEvent.click(screen.getByRole('button', { name: 'Colonnes', exact: true }))
+  fireEvent.click(screen.getByRole('button', { name: /tmp · workshop/ }))
+  fireEvent.click(within(screen.getByRole('region', { name: 'Vue Colonnes' })).getByRole('button', { name: /refs/ }))
+  expect(screen.getByRole('checkbox', { name: 'Sélectionner a.png' }).checked).toBe(true)
+  fireEvent.click(screen.getByRole('button', { name: 'Liste', exact: true }))
+  expect(screen.getByRole('checkbox', { name: 'Sélectionner a.png' }).checked).toBe(true)
+})
+
+// 3 October 2026, 15:16 CEST: one history combines files and discussions while distinguishing a native message from a summary.
+it('centralizes history and displays real conversation provenance and exact body', () => {
+  const events = [{ id: 'prompt', type: 'prompt', title: 'Prompt', body: 'Exact user text.', provenance: { provider: 'Codex', mode: 'transcript' } }, { id: 'checkpoint', type: 'iteration', title: 'Iteration', body: 'Verified export.', provenance: { provider: 'antigravity', mode: 'checkpoint' } }, { id: 'transfer', type: 'archive', title: 'File archived' }]
+  render(<ProjectWorkspace projects={[{ id: 'history-demo', name: 'History', files: [], events }]} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Historique et discussions' }))
+  expect(screen.getByText(/Codex · Conversation capturée/)).toBeDefined()
+  expect(screen.getByText(/antigravity · Compte rendu de fin de tour/)).toBeDefined()
+  expect(screen.getAllByText('Exact user text.')).toHaveLength(2)
+  fireEvent.change(screen.getByRole('combobox', { name: 'Filtrer l’historique' }), { target: { value: 'discussion' } })
+  expect(screen.queryByText('File archived')).toBeNull()
+})
+
+// 3 October 2026, 15:42 CEST: filtered total, current page and selection retain distinct scopes.
+it('shows aggregate bytes for filtered results, the displayed page and selection', () => {
+  const files = [...Array.from({ length: 101 }, (_, index) => ({ id: `tile-${index}`, name: `tile${index}.png`, relativePath: `tiles/tile${index}.png`, sourceId: 'game', namespace: 'unreal', kind: 'image', size: 1_000_000 })), { id: 'unknown', name: 'notes.md', relativePath: 'notes.md', namespace: 'memory' }]
+  render(<ProjectWorkspace projects={[{ id: 'size-demo', name: 'Sizes', files }]} />)
+  expect(screen.getByLabelText('Taille des fichiers filtrés').textContent).toContain('101,0 Mo connus · 1 taille inconnue')
+  expect(screen.getByLabelText('Taille de la page affichée').textContent).toContain('affichés ·')
+  fireEvent.click(screen.getByRole('button', { name: 'Unreal', exact: true }))
+  expect(screen.getByLabelText('Taille des fichiers filtrés').textContent).toContain('101 fichiers · 101,0 Mo')
+  expect(screen.getByLabelText('Taille de la page affichée').textContent).toContain('100 affichés · 100,0 Mo')
+  fireEvent.change(screen.getByRole('textbox', { name: 'Rechercher un fichier' }), { target: { value: 'tile100' } })
+  expect(screen.getByLabelText('Taille des fichiers filtrés').textContent).toContain('1 fichiers · 1,0 Mo')
+  expect(screen.queryByLabelText('Taille de la page affichée')).toBeNull()
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Sélectionner tile100.png' }))
+  expect(screen.getByRole('status').textContent).toContain('1 sélectionnés · 1,0 Mo')
+})
+
+// 3 October 2026, 22:16 CEST: layouts expose both locations and do not mistake an absent Mac file for a missing archive.
+it('keeps complete Mac and cloud paths in list, icons, gallery and source columns', () => {
+  const file = { id: 'scene:render/ad.mov', sourceId: 'scene', namespace: 'houdini', name: 'ad.mov', relativePath: 'render/ad.mov', localPath: '/Production/Tiles/render/ad.mov', cloudPath: 'pages/tiles/ad.mov.file.json', present: false, status: 'backed-up' }
+  render(<ProjectWorkspace projects={[{ id: 'locations', name: 'Locations', files: [file] }]} bridgeConnected />)
+  for (const view of ['Liste', 'Icônes', 'Galerie']) {
+    fireEvent.click(screen.getByRole('button', { name: view, exact: true }))
+    const groups = screen.getAllByRole('group', { name: 'Emplacements de ad.mov' })
+    expect(within(groups[0]).getByText('/Production/Tiles/render/ad.mov')).toBeTruthy()
+    expect(within(groups[0]).getByText('pages/tiles/ad.mov.file.json')).toBeTruthy()
+    expect(within(groups[0]).getByText('Absent de ce Mac')).toBeTruthy()
+    expect(within(groups[0]).getByText('Sauvegardé')).toBeTruthy()
+  }
+  fireEvent.click(screen.getByRole('button', { name: 'Colonnes', exact: true }))
+  const columns = screen.getByRole('region', { name: 'Vue Colonnes' })
+  fireEvent.click(within(columns).getByRole('button', { name: /houdini · scene/ }))
+  fireEvent.click(within(columns).getByRole('button', { name: /^render / }))
+  expect(within(columns).getByText('/Production/Tiles/render/ad.mov')).toBeTruthy()
+  expect(within(columns).getByText('pages/tiles/ad.mov.file.json')).toBeTruthy()
+})
+
+// 4 October 2026, 00:25 CEST: project-bound conversations have their own individual entry and explicit provider.
+it('opens an individual project-bound conversation without adding it to the project shelf', async () => {
+  const conversation = { id: 'claude:session', provider: 'claude', title: 'A distinct discussion', projectId: 'tiles', readable: true, localPath: '/original/session.jsonl', updatedAt: '2026-10-04T00:00:00Z' }
+  const readConversation = vi.fn().mockResolvedValue({ messages: [{ id: 'message', kind: 'prompt', text: 'Original human message' }], nextBefore: null })
+  render(<ProjectWorkspace projects={[{ id: 'tiles', name: 'Tiles', files: [] }]} conversations={[conversation]} readConversation={readConversation} activeProjectId="tiles" bridgeConnected />)
+  fireEvent.click(screen.getByRole('button', { name: /Conversations 1/ }))
+  fireEvent.click(screen.getByRole('button', { name: /A distinct discussion/ }))
+  expect(await screen.findByText('Original human message')).toBeDefined()
+  expect(screen.getByRole('region', { name: 'Conversation originale' }).querySelector('[data-provider="claude"]')).toBeDefined()
+  expect(screen.getByText('Sauvegarde de la conversation non confirmée')).toBeDefined()
+  expect(screen.getByText('/original/session.jsonl')).toBeDefined()
+  expect(readConversation).toHaveBeenCalledWith('claude:session')
+})

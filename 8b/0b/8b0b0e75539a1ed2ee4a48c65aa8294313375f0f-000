@@ -1,0 +1,21 @@
+import { describe, expect, it } from 'vitest'
+import { PLAN_CSS_VARIABLES, PLAN_UI, planDateDirection, planDayLabel } from './planUiConfig.js'
+
+describe('ZenRay Plan UI config', () => {
+  it('keeps editable values connected to the CSS variables', () => {
+    expect(PLAN_CSS_VARIABLES['--zrp-font-task']).toBe(`${PLAN_UI.type.task}px`)
+    expect(PLAN_CSS_VARIABLES['--zrp-motion-panel']).toBe(`${PLAN_UI.motion.panel}ms`)
+  })
+
+  it('labels the current day as Today and other dates with full weekday names', () => {
+    expect(planDayLabel('2026-08-06', '2026-08-06')).toBe('Today')
+    expect(planDayLabel('2026-08-03', '2026-08-06')).toBe('Monday')
+    expect(planDayLabel('2026-08-09', '2026-08-06')).toBe('Sunday')
+  })
+
+  it('derives the animation direction from ISO dates', () => {
+    expect(planDateDirection('2026-08-07', '2026-08-06')).toBe('forward')
+    expect(planDateDirection('2026-07-31', '2026-08-01')).toBe('backward')
+    expect(planDateDirection('2026-08-06', '2026-08-06')).toBe('still')
+  })
+})

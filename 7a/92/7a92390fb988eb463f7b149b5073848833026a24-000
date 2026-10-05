@@ -1,0 +1,99 @@
+// Réglages visuels propres à ZenRay Plan. Modifier ce fichier suffit pour ajuster la lisibilité
+// et l'intensité des mouvements sans toucher au thème partagé du reste de ZenRayProgress.
+export const PLAN_UI = {
+  // LES POLICES VIVENT ICI, ET NULLE PART AILLEURS (2026-08-16, demande de Matthieu). Elles étaient écrites en
+  // dur dans `PlanBoard.css`, à deux endroits, ce qui obligeait à chercher dans le CSS pour changer une police
+  // alors que toutes les autres valeurs du Plan se règlent dans ce fichier. Un réglage, un seul endroit.
+  //
+  // On pointe les variables du site plutôt que de réécrire les noms de familles : `--zr-police-sans` contient
+  // DÉJÀ « Hiragino Sans W4 » en tête, suivi de ses replis, et sa définition unique vit dans `src/fonts.css`.
+  // Recopier ces noms ici créait une seconde vérité qui aurait divergé au premier changement de police du site,
+  // exactement le défaut que ce fichier existe pour supprimer.
+  police: {
+    texte: 'var(--zr-police-sans)',
+    marque: 'var(--zr-police-sans)',
+  },
+  type: {
+    brand: 16,
+    control: 14,
+    label: 13,
+    input: 16,
+    weekday: 13,
+    dayNumber: 14,
+    task: 15,
+    taskTime: 13,
+    detailTitle: 19,
+    detailBody: 14,
+    meta: 13,
+    mobileDate: 17,
+  },
+  size: {
+    control: 44,
+    taskMin: 48,
+    dayMin: 150,
+  },
+  motion: {
+    micro: 150,
+    state: 250,
+    popover: 280,
+    panel: 350,
+    confirm: 320,
+    refuse: 350,
+    pressScale: 0.94,
+    releaseScale: 1.03,
+    panelScale: 0.94,
+    panelTravel: 12,
+    contentTravel: 6,
+    dateTravel: 8,
+  },
+}
+
+const px = (value) => `${value}px`
+const ms = (value) => `${value}ms`
+
+export const PLAN_CSS_VARIABLES = {
+  '--zrp-police': PLAN_UI.police.texte,
+  '--zrp-police-marque': PLAN_UI.police.marque,
+  '--zrp-font-brand': px(PLAN_UI.type.brand),
+  '--zrp-font-control': px(PLAN_UI.type.control),
+  '--zrp-font-label': px(PLAN_UI.type.label),
+  '--zrp-font-input': px(PLAN_UI.type.input),
+  '--zrp-font-weekday': px(PLAN_UI.type.weekday),
+  '--zrp-font-day': px(PLAN_UI.type.dayNumber),
+  '--zrp-font-task': px(PLAN_UI.type.task),
+  '--zrp-font-task-time': px(PLAN_UI.type.taskTime),
+  '--zrp-font-detail-title': px(PLAN_UI.type.detailTitle),
+  '--zrp-font-detail-body': px(PLAN_UI.type.detailBody),
+  '--zrp-font-meta': px(PLAN_UI.type.meta),
+  '--zrp-font-mobile-date': px(PLAN_UI.type.mobileDate),
+  '--zrp-control-size': px(PLAN_UI.size.control),
+  '--zrp-task-min': px(PLAN_UI.size.taskMin),
+  '--zrp-day-min': px(PLAN_UI.size.dayMin),
+  '--zrp-motion-micro': ms(PLAN_UI.motion.micro),
+  '--zrp-motion-state': ms(PLAN_UI.motion.state),
+  '--zrp-motion-popover': ms(PLAN_UI.motion.popover),
+  '--zrp-motion-panel': ms(PLAN_UI.motion.panel),
+  '--zrp-motion-confirm': ms(PLAN_UI.motion.confirm),
+  '--zrp-motion-refuse': ms(PLAN_UI.motion.refuse),
+  '--zrp-press-scale': PLAN_UI.motion.pressScale,
+  '--zrp-release-scale': PLAN_UI.motion.releaseScale,
+  '--zrp-panel-scale': PLAN_UI.motion.panelScale,
+  '--zrp-panel-travel': px(PLAN_UI.motion.panelTravel),
+  '--zrp-content-travel': px(PLAN_UI.motion.contentTravel),
+  '--zrp-date-travel': px(PLAN_UI.motion.dateTravel),
+  '--zrp-date-travel-back': px(-PLAN_UI.motion.dateTravel),
+}
+
+const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+
+export function planDayLabel(selectedIso, todayIso) {
+  if (selectedIso === todayIso) return 'Today'
+  const [year, month, day] = String(selectedIso || '').split('-').map(Number)
+  const date = new Date(year, (month || 1) - 1, day || 1)
+  return WEEKDAY_NAMES[date.getDay()]
+}
+
+export function planDateDirection(nextIso, previousIso) {
+  if (nextIso === previousIso) return 'still'
+  return nextIso < previousIso ? 'backward' : 'forward'
+}

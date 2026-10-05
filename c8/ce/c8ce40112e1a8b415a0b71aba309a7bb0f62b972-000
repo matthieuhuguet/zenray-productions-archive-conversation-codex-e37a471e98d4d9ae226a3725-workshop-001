@@ -1,0 +1,27 @@
+// GALERIES-POINTEUR (2026-08-11) — SOURCE UNIQUE ÉDITABLE.
+//
+// Design, Characters, Environments partagent EXACTEMENT le même code (GalleryView.jsx) : ce sont
+// trois VUES d'un même mécanisme (une galerie-pointeur alimentée par « Ajouter à… » depuis le menu
+// contextuel de Create), pas trois composants distincts. Décision explicite de Matthieu : « les trois
+// fonctions partagent le même code... faut bien que ce soit indexé dans le code ». Ajouter une
+// quatrième galerie = ajouter une entrée ICI, jamais dupliquer GalleryView.jsx.
+//
+// Consommé par : Sidebar.jsx (entrées du drawer, une par galerie, dans l'ordre de cette liste),
+// App.jsx (rendu de la vue + sous-menu « Ajouter à… » du clic droit), GalleryView.jsx (chemin du
+// store JSON à lire/écrire).
+export const POINTER_GALLERIES = [
+  // ToDo-3D (2026-08-29, demande de Matthieu) : EN TÊTE de la zone Gallery, et cette place est le
+  // sens même de la galerie. Les autres montrent ce qui est fait ; celle-ci montre ce qui reste à
+  // faire, donc elle se lit en premier ou elle ne se lit pas. L'ordre de ce tableau EST l'ordre du
+  // drawer (Sidebar.jsx boucle dessus sans le retrier) : déplacer cette ligne suffit à la déplacer.
+  { key: 'todo3d', label: 'ToDo-3D', path: 'pages/ToDo-3D/todo-3d.json' },
+  { key: 'design', label: 'Design', path: 'pages/Design/design.json' },
+  { key: 'characters', label: 'Characters', path: 'pages/Characters/characters.json' },
+  { key: 'environments', label: 'Environments', path: 'pages/Environments/environments.json' },
+  { key: 'japan', label: 'Japan', path: 'pages/Japan/japan.json' },
+  // ZenRayShards (2026-08-21) : la galerie de references visuelles du jeu. Un PureRef qui ne dit
+  // pas son nom -- image + titre + note descriptive, groupes nommes, remise en ordre a la main.
+  { key: 'zenrayshards', label: 'ZenRayShards', path: 'pages/ZenRayShards/zenrayshards.json' },
+]
+
+export const galleryByKey = (key) => POINTER_GALLERIES.find((g) => g.key === key) || null

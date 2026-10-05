@@ -1,0 +1,45 @@
+// 4 October 2026, 10:40 CEST: opening, safe formatting and asynchronous navigation are verified with real reader responses.
+import React from 'react'
+import { afterEach, expect, it, vi } from 'vitest'
+import { cleanup, fireEvent, render, screen, waitFor, act } from '@testing-library/react'
+import ConversationView from './ConversationView.jsx'
+afterEach(cleanup)
+const conversation = { id: 'claude:one', provider: 'claude', title: 'Original discussion', readable: true, localPath: '/source/one.jsonl' }
+it('opens original messages, renders safe Markdown and expands full user prompts', async () => {
+  const text = 'Actual long prompt '.repeat(100)
+  const read = vi.fn().mockResolvedValue({ messages: [{ id: 'p', kind: 'prompt', text }, { id: 'a', kind: 'response', text: '## Result\n\n- Actual answer\n\n```js\nconst value = 1\n```\n\n<script>alert(1)</script>\n\n[bad](javascript:alert(1))' }], nextBefore: null })
+  const { container } = render(<ConversationView conversation={conversation} readConversation={read} connected />)
+  await screen.findByText('Actual answer')
+  expect(read).toHaveBeenCalledWith(conversation.id)
+  expect(container.querySelector('pre code').textContent).toContain('const value = 1')
+  expect(container.querySelector('script')).toBeNull()
+  expect(container.querySelector('a[href^="javascript:"]')).toBeNull()
+  expect(container.querySelector('[data-role="user"] [data-collapsed="true"]')).not.toBeNull()
+  fireEvent.click(screen.getByText('Afficher tout le message'))
+  expect(container.querySelector('[data-role="user"] [data-collapsed="true"]')).toBeNull()
+  expect(container.querySelector('[data-role="user"] .assets-chat-message-body p').textContent).toBe(text)
+  fireEvent.click(screen.getByText('Emplacements et sauvegarde'))
+  expect(screen.getByText('/source/one.jsonl')).toBeDefined()
+})
+it('ignores older-page responses after selecting another conversation', async () => {
+  let resolveOlder
+  const read = vi.fn((id, before) => before ? new Promise(resolve => { resolveOlder = resolve }) : Promise.resolve({ messages: [{ id, kind: 'response', text: id === conversation.id ? 'First discussion' : 'Second discussion' }], nextBefore: id === conversation.id ? { source: 20 } : null }))
+  const { rerender } = render(<ConversationView conversation={conversation} readConversation={read} connected />)
+  await screen.findByText('First discussion')
+  fireEvent.click(screen.getByText('Charger les messages précédents'))
+  rerender(<ConversationView conversation={{ ...conversation, id: 'claude:two' }} readConversation={read} connected />)
+  await screen.findByText('Second discussion')
+  await act(async () => resolveOlder({ messages: [{ id: 'old', kind: 'response', text: 'Wrong discussion older message' }], nextBefore: null }))
+  expect(screen.queryByText('Wrong discussion older message')).toBeNull()
+})
+it('retries a failed opening and labels missing originals without inventing messages', async () => {
+  const read = vi.fn().mockRejectedValueOnce(new Error('Read failed')).mockResolvedValue({ messages: [{ id: 'ok', kind: 'response', text: 'Recovered response' }], nextBefore: null })
+  const { rerender } = render(<ConversationView conversation={conversation} readConversation={read} connected />)
+  await screen.findByText('Read failed')
+  fireEvent.click(screen.getByText('Réessayer'))
+  await screen.findByText('Recovered response')
+  expect(read).toHaveBeenLastCalledWith(conversation.id, undefined)
+  rerender(<ConversationView conversation={{ ...conversation, id: 'missing', readable: false, unavailableReason: 'transcript-missing' }} readConversation={read} connected />)
+  await waitFor(() => expect(screen.queryByText('Recovered response')).toBeNull())
+  expect(screen.getByText(/son texte original manque/)).toBeDefined()
+})

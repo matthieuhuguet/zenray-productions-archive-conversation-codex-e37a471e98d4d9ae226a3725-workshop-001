@@ -1,0 +1,92 @@
+// UnifiedViewer.jsx — DISPATCH UNIQUE d'un nœud vers son viewer, par typeOfPath(path).
+//
+// EN CLAIR : « ouvrir un fichier » devait choisir le bon afficheur (image inline, lecteur vidéo/audio/pdf,
+// viewer d'archive, table, board, embed). Cette décision était écrite DEUX fois : dans le Finder (App.jsx) et,
+// clonée, dans le Quick Look (aperçu plein écran). Deux copies = deux risques de divergence. Ce composant
+// centralise le choix : UNE table type -> viewer. Les viewers EUX-MÊMES sont inchangés (refactor de plomberie,
+// zéro changement de comportement). Le `.file.json` v2/v3/v4 s'ouvre exactement comme avant (FileNodeViewer intact).
+//
+// Le type 'page' (note Markdown) n'est PAS géré ici : l'éditeur dépend de trop d'état local d'App.jsx
+// (pageWide, sous-pages, PropertiesBlock). UnifiedViewer rend alors `renderPage()` (ou rien), laissant App
+// monter son éditeur. Ainsi un seul chemin couvre tous les types MÉDIA/DONNÉE, montable en Finder ET en Quick Look.
+
+import React from 'react'
+import { typeOfPath } from './node.js'
+import { lazyRetry } from '../lib/lazyRetry.js'
+
+const LazyImageNodeViewer = lazyRetry(() => import('../components/ImageNodeViewer.jsx'))
+const LazyMediaViewer = lazyRetry(() => import('../components/MediaViewer.jsx'))
+const LazyFileNodeViewer = lazyRetry(() => import('../components/FileNodeViewer.jsx'))
+// RefBoardHost (pas CanvasNodeViewer nu) : bug réel corrigé le 2026-07-19 — le double-clic sur un
+// board depuis Create passait ICI directement en CanvasNodeViewer, court-circuitant TOUTE la couche
+// drag & drop / paste (RefBoardHost, "lot B"), qui n'était alors montée que par l'ancien écran Ref
+// (RefApp, retiré de la sidebar). Conséquence : glisser une image sur un board fraîchement créé ne
+// faisait rien. RefBoardHost rend CanvasNodeViewer en interne — zéro changement pour les autres types.
+const LazyCanvasNodeViewer = lazyRetry(() => import('../ref/RefBoardHost.jsx'))
+const LazyEmbedNodeViewer = lazyRetry(() => import('../components/EmbedNodeViewer.jsx'))
+const LazyDatabaseTable = lazyRetry(() => import('../components/DatabaseTable.jsx'))
+
+const Fallback = ({ t, label }) => <div style={{ padding: 24, color: t ? t.textSecondary : '#888' }}>{label}</div>
+
+// ═══ PRÉCHARGER LE BOARD AVANT LE CLIC ══════════════════════════════════════════════════════════
+//
+// `RefBoardHost` embarque tldraw en entier, 1 415 Ko mesurés le 2026-08-30. Ce n'est pas un défaut
+// de code, c'est le prix de la bibliothèque, et il se paie au moment le plus visible : celui où
+// Matthieu vient de cliquer et attend. Ses mots : « ça s'ouvre encore 2 secondes puis rebloc gris ».
+//
+// La seule parade honnête est de tirer l'octet PENDANT qu'il regarde autre chose. On expose donc le
+// geste, et les endroits qui savent qu'un board va s'ouvrir l'appellent : la bibliothèque Ref au
+// montage, le survol d'une ligne `.ref.json`. Le préchargement passe par `requestIdleCallback`, donc
+// il ne vole jamais une image d'animation à un défilement en cours.
+export const precharcherBoardRef = () => LazyCanvasNodeViewer.precharger && LazyCanvasNodeViewer.precharger()
+
+// L'ATTENTE DOIT SE VOIR, sinon elle se lit comme une panne. Un rectangle gris muet pendant deux
+// secondes ne dit pas « je charge », il dit « c'est cassé », et c'est exactement ce que Matthieu a
+// lu deux fois de suite. Une pulsation et une phrase suffisent à faire la différence.
+const CHARGEMENT_BOARD = ({ t }) => (
+  <div style={{
+    position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
+    alignItems: 'center', justifyContent: 'center', gap: 12,
+    fontFamily: 'var(--zr-police-sans)', color: t ? t.textSecondary : '#888',
+  }}>
+    <span style={{
+      width: 22, height: 22, borderRadius: 999,
+      border: '2px solid color-mix(in srgb, currentColor 24%, transparent)',
+      borderTopColor: 'currentColor', animation: 'zrBoardSpin .8s linear infinite',
+    }} />
+    <span style={{ fontSize: 'var(--zr-ui-sm)', fontWeight: 400 }}>Ouverture du board…</span>
+    <span style={{ fontSize: 'var(--zr-ui-2xs)', opacity: .62 }}>Chargement de l’éditeur de canevas, une seule fois par session.</span>
+    <style>{'@keyframes zrBoardSpin{to{transform:rotate(360deg)}}'}</style>
+  </div>
+)
+
+// UnifiedViewer : { t, path, title, theme, dark } communs. Props spécifiques optionnelles passées tels quels
+// aux viewers qui en ont besoin (DatabaseTable : pages/onOpenPage ; Canvas : theme). renderPage / renderDefault
+// laissent App gérer l'éditeur Markdown et le cas par défaut sans dupliquer cet état ici.
+export default function UnifiedViewer({ t, path, title, theme, dark, dbPages, onOpenPage, renderPage, renderDefault }) {
+  const type = typeOfPath(path)
+
+  if (type === 'image') {
+    return <React.Suspense fallback={<Fallback t={t} label="chargement de l'image…" />}><LazyImageNodeViewer key={path} t={t} path={path} title={title} /></React.Suspense>
+  }
+  if (type === 'media') {
+    return <React.Suspense fallback={<Fallback t={t} label="chargement du média…" />}><LazyMediaViewer key={path} t={t} path={path} title={title} /></React.Suspense>
+  }
+  if (type === 'file') {
+    // ARCHIVE universelle (.file.json) : aperçu + téléchargement bit à bit. INCHANGÉ (rétrocompat 130 Go).
+    return <React.Suspense fallback={<Fallback t={t} label="chargement du fichier…" />}><LazyFileNodeViewer key={path} t={t} path={path} title={title} /></React.Suspense>
+  }
+  if (type === 'canvas') {
+    return <React.Suspense fallback={<CHARGEMENT_BOARD t={t} />}><LazyCanvasNodeViewer key={path} t={t} path={path} title={title} theme={theme || (dark ? 'dark' : 'light')} /></React.Suspense>
+  }
+  if (type === 'embed') {
+    return <React.Suspense fallback={<Fallback t={t} label="chargement de l'embed…" />}><LazyEmbedNodeViewer key={path} t={t} path={path} title={title} /></React.Suspense>
+  }
+  if (type === 'db') {
+    return <React.Suspense fallback={<Fallback t={t} label="chargement de la table…" />}><LazyDatabaseTable key={path} t={t} path={path} title={title} pages={dbPages} onOpenPage={onOpenPage} /></React.Suspense>
+  }
+  // 'page' ou inconnu : délégué à App (éditeur Markdown + état local). UnifiedViewer ne le gère pas.
+  if (type === 'page' && typeof renderPage === 'function') return renderPage()
+  if (typeof renderDefault === 'function') return renderDefault()
+  return null
+}
