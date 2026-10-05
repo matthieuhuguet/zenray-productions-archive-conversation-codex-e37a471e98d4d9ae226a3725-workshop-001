@@ -1,0 +1,14 @@
+import { defineConfig, configDefaults } from 'vitest/config'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  test: {
+    environment: 'jsdom',
+    setupFiles: ['./tests/setup.js'],
+    restoreMocks: true,
+    clearMocks: true,
+    // relay/ is plain Node (node --test relay/), outside the browser suite. / FR : le relais se teste par node --test.
+    exclude: [...configDefaults.exclude, 'relay/**'],
+  },
+})

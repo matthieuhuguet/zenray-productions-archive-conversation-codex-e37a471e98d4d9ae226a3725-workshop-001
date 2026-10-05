@@ -1,0 +1,79 @@
+// 3 October 2026 10:38: Verify persisted grouping and reordering through real tile drops.
+import React from 'react'
+import { render, fireEvent, createEvent, waitFor, cleanup } from '@testing-library/react'
+import { vi, test, expect, afterEach } from 'vitest'
+import GalleryView from './GalleryView.jsx'
+import { POINTER_GALLERIES } from '../config/pointerGalleries.js'
+const store = vi.hoisted(() => ({ data: null }))
+vi.mock('../lib/saveJson.js', () => ({
+  readJson: vi.fn(async () => ({ data: store.data, sha: 'one' })),
+  saveJsonWithRetry: vi.fn(async (path, update) => { store.data = update(store.data); return { ok: true, sha: 'two' } }),
+}))
+vi.mock('../clipboard/ClipboardProvider.jsx', () => ({ useClipboardTarget: vi.fn() }))
+vi.mock('./ImageNodeViewer.jsx', () => ({ readImgManifestCached: vi.fn(async () => null), resolveThumbUrl: vi.fn(), resolveFullUrl: vi.fn() }))
+vi.mock('./Notifications.jsx', () => ({ notify: vi.fn() }))
+afterEach(() => { cleanup(); localStorage.clear() })
+const image = (id) => ({ id, kind: 'image', path: `https://example.com/${id}.png` })
+async function drop(key, x, initial = [image('a'), image('b')], layout = 'aligned') {
+  store.data = { v: 1, items: initial }
+  localStorage.setItem(`zr:gallery:layout:${key}`, layout)
+  const view = render(<GalleryView galleryKey={key} t={{ accent: 'blue' }} />)
+  await waitFor(() => expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(initial.length))
+  const tile = view.container.querySelectorAll('[draggable="true"]')[1]
+  tile.getBoundingClientRect = () => ({ left: 0, width: 100 })
+  const event = createEvent.drop(tile)
+  Object.defineProperties(event, { clientX: { value: x }, dataTransfer: { value: { types: ['application/zenray-gallery-item'], getData: () => 'a' } } })
+  fireEvent(tile, event)
+  await waitFor(() => expect(store.data.items).not.toEqual(initial))
+  return store.data.items
+}
+for (const gallery of POINTER_GALLERIES) {
+  test(`aligned center groups in ${gallery.key}`, async () => {
+    const items = await drop(gallery.key, 50)
+    expect(items).toHaveLength(1)
+    expect(items[0].items.map(x => x.id)).toEqual(['b', 'a'])
+  })
+}
+test('aligned right edge reorders without grouping', async () => {
+  expect((await drop(POINTER_GALLERIES[0].key, 95)).map(x => x.id)).toEqual(['b', 'a'])
+})
+test('aligned center adds to an existing group', async () => {
+  const items = await drop(POINTER_GALLERIES[0].key, 50, [image('a'), { id: 'folder', kind: 'folder', name: 'Group', items: [image('b')] }])
+  expect(items[0].items.map(x => x.id)).toEqual(['b', 'a'])
+})
+test('grid still groups on tile edges', async () => {
+  expect((await drop(POINTER_GALLERIES[0].key, 95, undefined, 'grid'))[0].kind).toBe('folder')
+})
+
+// 5 October 2026, 12:33 CEST: Completed projects retain their references across reload and restoration.
+vi.mock('./ActionColumnMenu.jsx', () => ({
+  ActionColumnPopover: ({ nodes }) => <div>{nodes.map(node => <button key={node.id} onClick={node.action}>{node.label}</button>)}</div>,
+}))
+test('ToDo-3D persists Done and restores a completed group without losing references', async () => {
+  const project = { id: 'project', kind: 'folder', name: 'Finished project', items: [image('a'), image('b')] }
+  store.data = { v: 1, items: [project, image('c')] }
+  let view = render(<GalleryView galleryKey="todo3d" t={{ accent: 'blue' }} />)
+  await waitFor(() => expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(2))
+  fireEvent.contextMenu(view.container.querySelector('[draggable="true"]'))
+  fireEvent.click(view.getByText('Ranger dans Done'))
+  await waitFor(() => expect(store.data.items[0].status).toBe('done'))
+  expect(store.data.items[0].items).toEqual(project.items)
+  view.unmount()
+  view = render(<GalleryView galleryKey="todo3d" t={{ accent: 'blue' }} />)
+  await waitFor(() => expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(1))
+  expect(view.queryByText('Finished project')).toBeNull()
+  fireEvent.click(view.getByRole('button', { name: 'Done' }))
+  expect(view.getByText('Finished project')).toBeTruthy()
+  fireEvent.contextMenu(view.container.querySelector('[draggable="true"]'))
+  fireEvent.click(view.getByText('Remettre en cours'))
+  await waitFor(() => expect(store.data.items[0].status).toBe('active'))
+  fireEvent.click(view.getByRole('button', { name: 'En cours' }))
+  expect(view.getByText('Finished project')).toBeTruthy()
+  expect(store.data.items[0].items).toEqual(project.items)
+})
+test('other galleries keep completed cards visible without a Done section', async () => {
+  store.data = { v: 1, items: [{ ...image('a'), status: 'done' }] }
+  const view = render(<GalleryView galleryKey="characters" t={{ accent: 'blue' }} />)
+  await waitFor(() => expect(view.container.querySelectorAll('[draggable="true"]')).toHaveLength(1))
+  expect(view.queryByRole('button', { name: 'Done' })).toBeNull()
+})

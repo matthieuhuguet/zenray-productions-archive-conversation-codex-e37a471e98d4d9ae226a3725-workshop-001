@@ -1,0 +1,29 @@
+// 5 October 2026, 12:34 CEST: Verify the real gallery in an isolated browser with fixture data.
+import { createRequire } from 'node:module'
+const require = createRequire('/Users/zenray/Create/Build/Productions/GithubProductions/ZenRayProgress/package.json')
+const { chromium } = require('@playwright/test')
+const browser = await chromium.launch({ headless: true, channel: "chrome" })
+const page = await browser.newPage({ viewport: { width: 1100, height: 700 } })
+page.on('pageerror', error => console.log(error.message))
+page.on('console', message => { if (message.type() === 'error') console.log(message.text()) })
+const image = { id: 'image', kind: 'image', path: 'https://fixture.test/image.svg', title: 'Eucalyptus' }
+let data = { v: 1, items: [{ id: 'project', kind: 'folder', name: 'Projet fini', items: [image] }, image] }
+await page.route('**/api/page**', route => {
+  if (route.request().method() === 'POST') { data = JSON.parse(route.request().postDataJSON().markdown); return route.fulfill({ json: { ok: true, sha: 'two' } }) }
+  return route.fulfill({ json: { markdown: JSON.stringify(data), sha: 'one' } })
+})
+await page.route('https://fixture.test/image.svg', route => route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300"><rect width="400" height="300" fill="#b8cca6"/><circle cx="200" cy="100" r="80" fill="#417246"/><path d="M200 100v180" stroke="#675b39" stroke-width="18"/></svg>' }))
+await page.route('http://127.0.0.1:5207/visual-proof', route => route.fulfill({ contentType: 'text/html', body: `<html><head><link rel="stylesheet" href="/src/fonts.css"></head><body style="padding:40px;background:#e0e5e2"><div id="root"></div><script type="module">import RefreshRuntime from '/@react-refresh';RefreshRuntime.injectIntoGlobalHook(window);window.$RefreshReg$=()=>{};window.$RefreshSig$=()=>type=>type;window.__vite_plugin_react_preamble_installed__=true;import React from '/node_modules/.vite/deps/react.js';import ReactDOM from '/node_modules/.vite/deps/react-dom_client.js';const {default:GalleryView}=await import('/src/components/GalleryView.jsx');ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(GalleryView,{galleryKey:'todo3d',t:{surface:'rgba(255,255,255,.6)',textPrimary:'#222',textSecondary:'#666',accent:'blue'}}));</script></body></html>` }))
+await page.goto('http://127.0.0.1:5207/visual-proof')
+await page.getByText(/^Projet fini/).waitFor({timeout:5000}).catch(async error => { console.log(await page.locator('body').innerText()); throw error })
+await page.locator('[draggable=true]').first().click({ button: 'right' })
+await page.getByText('Ranger dans Done', { exact: true }).click()
+await page.getByRole('button', { name: 'Done', exact: true }).click()
+await page.getByText(/^Projet fini/).waitFor()
+await page.getByText(/^Projet fini/).click()
+await page.getByRole('textbox', { name: 'Titre', exact: true }).waitFor()
+const style = await page.getByRole('textbox', { name: 'Titre', exact: true }).evaluate(el => ({ field: getComputedStyle(el).backgroundColor, overlay: getComputedStyle(el.parentElement).backgroundColor }))
+if (style.overlay !== 'rgba(12, 12, 14, 0.28)') throw new Error(JSON.stringify(style))
+await page.screenshot({ path: '/Users/zenray/.claude/tmp/tmp-conversation-codex-e37a471e98d4d9ae226a3725/DoneEditor.png' })
+console.log(JSON.stringify({ persistedStatus: data.items[0].status, references: data.items[0].items.length, style }))
+await browser.close()
