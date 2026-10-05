@@ -1,0 +1,50 @@
+// @vitest-environment node
+// 4 October 2026, 00:25 CEST: historical sessions stay distinct, originals stay unchanged, arbitrary paths are rejected.
+import { it, expect } from 'vitest'
+import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises'
+import path from 'node:path'
+import os from 'node:os'
+import { createConversationCatalog } from './ConversationCatalog.mjs'
+it('indexes old Claude and Codex originals by activity, including unbound sessions without copying content', async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'conversation-catalog-'))
+  try {
+    const stateDir = path.join(home, 'state'); await mkdir(stateDir)
+    await writeFile(path.join(stateDir, 'SessionBindings.json'), JSON.stringify({ 'claude-session': 'tiles' }))
+    const roots = ['.claude/projects/project', '.codex/sessions/2025', '.gemini/antigravity/conversations']
+    for (const root of roots) await mkdir(path.join(home, root), { recursive: true })
+    const original = JSON.stringify({ sessionId: 'claude-session', type: 'user', timestamp: '2025-01-01T00:00:00Z', message: { role: 'user', content: 'Build tiles' } }) + '\n'
+    const filename = path.join(home, roots[0], 'claude-session.jsonl'); await writeFile(filename, original)
+    await writeFile(path.join(home, roots[1], 'codex.jsonl'), [ { type: 'session_meta', payload: { id: 'codex-session' }, timestamp: '2026-01-01T00:00:00Z' }, { type: 'response_item', timestamp: '2026-01-02T00:00:00Z', payload: { role: 'user', content: [{ type: 'input_text', text: 'Actual question' }] } } ].map(JSON.stringify).join('\n') + '\n')
+    await writeFile(path.join(home, roots[2], '46f51be7-b5c4-4620-bfe0-a01a99118a3e.db'), 'binary placeholder')
+    const catalog = createConversationCatalog({ home, stateDir }), result = await catalog.list()
+    expect(result.conversations).toHaveLength(3)
+    const claude = result.conversations.find(item => item.provider === 'claude')
+    expect(claude).toMatchObject({ projectId: 'tiles', title: 'Build tiles', cloudPath: null })
+    expect(result.conversations.find(item => item.provider === 'gemini')).toMatchObject({ readable: true, dateBasis: 'file-modified' })
+    expect(result.conversations.filter(item => item.provider !== 'gemini').map(item => item.provider)).toEqual(['codex', 'claude'])
+    expect((await catalog.read(claude.id)).messages[0].text).toBe('Build tiles')
+    expect(await readFile(filename, 'utf8')).toBe(original)
+    await expect(catalog.read('/etc/passwd')).rejects.toThrow('not found')
+    await expect(catalog.read(claude.id, -1)).rejects.toThrow('cursor')
+    await expect(catalog.read(result.conversations.find(item => item.provider === 'gemini').id)).rejects.toThrow()
+  } finally { await rm(home, { recursive: true, force: true }) }
+})
+
+// 4 October 2026, 09:40 CEST: mirrored Desktop cards share the CLI identity, keeping unmatched historical cards visible.
+it('deduplicates Claude account cards and reunites the actual CLI transcript', async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'conversation-accounts-'))
+  try {
+    const root = path.join(home, 'Library/Application Support/Claude/claude-code-sessions')
+    for (const account of ['one', 'two']) {
+      await mkdir(path.join(root, account, 'workspace'), { recursive: true })
+      await writeFile(path.join(root, account, 'workspace/local_shared.json'), JSON.stringify({ sessionId: 'local_shared', cliSessionId: 'real-cli-session', title: 'Shared discussion', lastActivityAt: Date.parse('2026-10-04T08:00:00Z') }))
+    }
+    const transcripts = path.join(home, '.claude/projects/project'); await mkdir(transcripts, { recursive: true })
+    await writeFile(path.join(transcripts, 'real-cli-session.jsonl'), JSON.stringify({ sessionId: 'real-cli-session', type: 'user', timestamp: '2026-10-04T08:00:00Z', message: { role: 'user', content: 'Original message' } }) + '\n')
+    const catalog = createConversationCatalog({ home, stateDir: home }), result = await catalog.list()
+    expect(result.conversations).toHaveLength(1)
+    expect(result.conversations[0].originalPaths).toHaveLength(3)
+    expect(result.conversations[0].readable).toBe(true)
+    expect((await catalog.read('claude:real-cli-session')).messages).toHaveLength(1)
+  } finally { await rm(home, { recursive: true, force: true }) }
+})

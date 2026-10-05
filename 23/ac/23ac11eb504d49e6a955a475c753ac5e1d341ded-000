@@ -1,0 +1,38 @@
+// 2 October 2026, 15:05 CEST: only independently verified managed workspaces can be released.
+import { constants } from 'node:fs'
+import { lstat, open, readdir, realpath } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import path from 'node:path'
+
+export async function verifyWorkspaceTree(directory, files) {
+  if (!files.length) throw new Error('Empty workspace proof refused')
+  if (await realpath(directory) !== directory || !(await lstat(directory)).isDirectory()) throw new Error('Unsafe workspace root')
+  const expected = new Map(files.map((file) => [file.relativePath, file]))
+  if (expected.size !== files.length) throw new Error('Duplicate workspace proof')
+  let bytes = 0, allocatedBytes = 0
+  const seen = new Set()
+  const visit = async (folder, prefix = '') => {
+    for (const entry of await readdir(folder, { withFileTypes: true })) {
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name
+      const target = path.join(folder, entry.name)
+      if (entry.isSymbolicLink()) throw new Error('Workspace symlink refused')
+      if (entry.isDirectory()) { await visit(target, relative); continue }
+      const proof = expected.get(relative)
+      if (!entry.isFile() || !proof) throw new Error(`Untracked workspace file: ${relative}`)
+      const descriptor = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW)
+      try {
+        const before = await descriptor.stat()
+        const hash = createHash('sha256')
+        for await (const chunk of descriptor.createReadStream({ autoClose: false })) hash.update(chunk)
+        const after = await descriptor.stat()
+        if (before.size !== proof.size || hash.digest('hex') !== proof.sha256 || before.ctimeMs !== after.ctimeMs || before.mtimeMs !== after.mtimeMs || before.size !== after.size) {
+          throw new Error(`Modified workspace file retained: ${relative}`)
+        }
+        seen.add(relative); bytes += before.size; allocatedBytes += Number(before.blocks || 0) * 512
+      } finally { await descriptor.close() }
+    }
+  }
+  await visit(directory)
+  if (seen.size !== expected.size) throw new Error('Workspace file missing; release refused')
+  return { count: seen.size, bytes, allocatedBytes }
+}

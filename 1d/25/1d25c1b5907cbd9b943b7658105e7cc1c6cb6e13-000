@@ -1,0 +1,92 @@
+// @vitest-environment node
+// 2 October 2026, 20:09 CEST: cloud mappings retain other projects and publish a plain Markdown context entry point.
+import { it, expect } from 'vitest'
+import { createAssetsCloudPublisher, compactRegistryProject } from './AssetsCloudPublisher.mjs'
+
+// 3 October 2026, 21:57 CEST: every partial write must fail visibly and recover without dropping another project's mapping.
+it.each(['pages/ZenRayAssets/tiles/.workspace.json', 'pages/.zr-assets-workspaces.json', 'pages/ZenRayAssets/tiles/.context.md'])('recovers a failed publication of %s without duplicating or losing project identities', async (failedPath) => {
+  const core = { id: 'core', name: 'Core', folder: 'pages/ZenRayAssets/core', sources: [], files: [] }
+  const data = new Map([['pages/.zr-assets-workspaces.json', JSON.stringify({ projects: [core] })]])
+  let fail = true
+  const fetchImpl = async (url, options) => {
+    if (options.method !== 'POST') {
+      const file = new URL(url).searchParams.get('path')
+      return new Response(JSON.stringify(data.has(file) ? { markdown: data.get(file), sha: 'current' } : { missing: true }), { status: data.has(file) ? 200 : 404 })
+    }
+    const body = JSON.parse(options.body)
+    if (fail && body.path === failedPath) { fail = false; return new Response(JSON.stringify({ error: 'Simulated outage' }), { status: 503 }) }
+    data.set(body.path, body.markdown)
+    return new Response(JSON.stringify({ ok: true }))
+  }
+  const publish = createAssetsCloudPublisher({ baseUrl: 'http://localhost', fetchImpl })
+  const snapshot = { id: 'tiles', name: 'Tiles', folder: 'pages/ZenRayAssets/tiles', sources: [], files: [] }
+  await expect(publish(snapshot)).rejects.toThrow(failedPath)
+  await publish(snapshot)
+  await publish(snapshot)
+  expect(JSON.parse(data.get('pages/.zr-assets-workspaces.json')).projects.map(project => project.id)).toEqual(['core', 'tiles'])
+  expect(JSON.parse(data.get('pages/ZenRayAssets/tiles/.workspace.json'))).toEqual(snapshot)
+  expect(data.get('pages/ZenRayAssets/tiles/.context.md')).toContain('Tiles')
+})
+
+it('retries a conflicting global mapping write and publishes a cloud-safe context', async () => {
+  const core = { id: 'core', name: 'Core', folder: 'pages/ZenRayAssets/core', sources: [], files: [] }
+  const data = new Map([['pages/.zr-assets-workspaces.json', JSON.stringify({ projects: [core] })]])
+  let conflicts = 1
+  const fetchImpl = async (url, options) => {
+    if (options.method !== 'POST') {
+      const file = new URL(url).searchParams.get('path')
+      return new Response(JSON.stringify(data.has(file) ? { markdown: data.get(file), sha: 'previous' } : { missing: true }), { status: data.has(file) ? 200 : 404 })
+    }
+    const body = JSON.parse(options.body)
+    if (body.path === 'pages/.zr-assets-workspaces.json' && conflicts-- > 0) return new Response(JSON.stringify({ conflict: true }), { status: 409 })
+    data.set(body.path, body.markdown)
+    return new Response(JSON.stringify({ ok: true }))
+  }
+  const publish = createAssetsCloudPublisher({ baseUrl: 'http://localhost', fetchImpl })
+  await publish({ id: 'tiles', name: 'Tiles', folder: 'pages/ZenRayAssets/tiles', sources: [{ id: 'content', namespace: 'unreal', include: ['Content/Tiles'] }], files: [], dependencies: [{ projectId: 'core' }] })
+  const registry = JSON.parse(data.get('pages/.zr-assets-workspaces.json'))
+  expect(registry.projects.map((project) => project.id)).toEqual(['core', 'tiles'])
+  expect(registry.index.projects.tiles.dependencies).toEqual(['core'])
+  expect(registry.index.issues).toEqual([])
+  expect(data.get('pages/ZenRayAssets/tiles/.context.md')).toContain('pages/ZenRayAssets/core/.workspace.json')
+  expect(data.get('pages/ZenRayAssets/tiles/.context.md')).not.toContain('localPath')
+})
+
+it('retains a large existing registry when GitHub omits its Contents body', async () => {
+  const core = { id: 'core', name: 'Core', folder: 'pages/ZenRayAssets/core', sources: [], files: [] }
+  let registry = JSON.stringify({ projects: [core] })
+  const fetchImpl = async (url, options) => {
+    const query = new URL(url).searchParams
+    if (url.includes('/git/blobs/')) return new Response(JSON.stringify({ sha: 'large-existing', encoding: 'base64', content: Buffer.from(registry).toString('base64') }))
+    if (options.method !== 'POST') return new Response(JSON.stringify(query.get('path') === 'pages/.zr-assets-workspaces.json'
+      ? { markdown: query.has('raw') ? registry : '', sha: 'large-existing' } : { missing: true }), { status: 200 })
+    const body = JSON.parse(options.body)
+    if (body.path === 'pages/.zr-assets-workspaces.json') { expect(body.sha).toBe('large-existing'); registry = body.markdown }
+    return new Response(JSON.stringify({ ok: true }))
+  }
+  await createAssetsCloudPublisher({ baseUrl: 'http://localhost', fetchImpl, token: 'test-only' })({ id: 'tiles', name: 'Tiles', folder: 'pages/ZenRayAssets/tiles', sources: [], files: [] })
+  expect(JSON.parse(registry).projects.map((project) => project.id)).toEqual(['core', 'tiles'])
+})
+
+it('refuses to replace an existing registry whose full body cannot be read', async () => {
+  let writes = 0
+  const fetchImpl = async (url, options) => {
+    if (options.method === 'POST') { writes++; return new Response(JSON.stringify({ ok: true })) }
+    const query = new URL(url).searchParams
+    return new Response(JSON.stringify(query.get('path') === 'pages/.zr-assets-workspaces.json' ? { markdown: '', sha: 'large-existing' } : { missing: true }))
+  }
+  await expect(createAssetsCloudPublisher({ baseUrl: 'http://localhost', fetchImpl, token: 'test-only' })({ id: 'tiles', folder: 'pages/ZenRayAssets/tiles', sources: [], files: [] })).rejects.toThrow('refusing to overwrite')
+  expect(writes).toBe(1)
+})
+
+// 3 October 2026, 10:25 CEST: compaction retains every user file and its cloud proof while removing duplicated transfer paths.
+it('compacts a catalogue idempotently without losing identities, hashes or download metadata', () => {
+  const project = { id: 'tiles', files: [{ id: 'workshop:Scene.hiplc', relativePath: 'Scene.hiplc', sourceId: 'workshop', namespace: 'tmp', size: 42, sha256: 'verified-hash', cloudPath: 'pages/Scene.hiplc.file.json', contentPath: 'pages/Scene.hiplc.file.json', manifestPath: 'pages/Scene.hiplc.file.json', sourceFolder: 'repeated-source', relativeManifest: 'Scene.hiplc.file.json', backedUpAt: 'historical-date', preservedOriginalVersion: { versionId: 'original-version' } }] }
+  const compact = compactRegistryProject(project)
+  expect(compact.files[0]).toMatchObject({ id: project.files[0].id, sha256: 'verified-hash', cloudPath: 'pages/Scene.hiplc.file.json', contentPath: 'pages/Scene.hiplc.file.json', size: 42, preservedOriginalVersion: { versionId: 'original-version' } })
+  expect(compact.files[0].manifestPath).toBeUndefined()
+  expect(compact.files[0].relativeManifest).toBeUndefined()
+  expect(project.files[0].relativeManifest).toBe('Scene.hiplc.file.json')
+  expect(compactRegistryProject(compact)).toEqual(compact)
+  expect(JSON.stringify(compact).length).toBeLessThan(JSON.stringify(project).length)
+})

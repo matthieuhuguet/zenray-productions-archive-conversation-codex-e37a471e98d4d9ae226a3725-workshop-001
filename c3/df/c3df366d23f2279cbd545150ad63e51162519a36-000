@@ -1,0 +1,20 @@
+// @vitest-environment node
+// 2 October 2026, 15:20 CEST: content pinning must refuse unknown versions and unsafe managed trees.
+import { describe, expect, it } from 'vitest'
+import { manifestByFingerprint } from '../src/lib/archiveChunks.js'
+
+describe('immutable archive recovery', () => {
+  it('selects an older version even when the current archive changed', () => {
+    const old = 'a'.repeat(64), latest = 'b'.repeat(64)
+    const manifest = { versions: [{ sha256: old, commit: 'first', size: 14 }, { sha256: latest, commit: 'second', size: 99 }] }
+    expect(manifestByFingerprint(manifest, old).commit).toBe('first')
+    expect(manifestByFingerprint(manifest, latest).size).toBe(99)
+    expect(() => manifestByFingerprint(manifest, 'c'.repeat(64))).toThrow('unavailable')
+    expect(() => manifestByFingerprint(manifest, 'invalid')).toThrow('Invalid')
+  })
+  it('supports an unversioned manifest without substituting another file', () => {
+    const manifest = { sha256: 'd'.repeat(64), size: 14 }
+    expect(manifestByFingerprint(manifest, manifest.sha256)).toBe(manifest)
+    expect(() => manifestByFingerprint(manifest, 'e'.repeat(64))).toThrow('unavailable')
+  })
+})

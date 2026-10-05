@@ -1,0 +1,19 @@
+// 2 October 2026, 14:11 CEST: commands use the existing private gate without printing credentials.
+import { readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
+import path from 'node:path'
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
+const config = JSON.parse(await readFile(path.join(root, 'scripts/AssetsConfig.json'), 'utf8'))
+let secret = process.env.ZENRAY_API_SECRET
+if (secret === undefined) {
+  try { secret = (await readFile(path.join(root, '.env.local'), 'utf8')).match(/^\s*ZENRAY_API_SECRET\s*=\s*(.*?)\s*$/m)?.[1]?.replace(/^["']|["']$/g, '') } catch {}
+}
+const [action = 'list', projectId, payload = '{}'] = process.argv.slice(2)
+const response = await fetch(`http://127.0.0.1:${config.bridge.port}${config.bridge.path}`, {
+  method: 'POST', headers: { 'content-type': 'application/json', 'x-zr-assets-client': '2', ...(secret ? { 'x-zr-auth': secret } : {}) },
+  body: JSON.stringify({ ...JSON.parse(payload), action, ...(projectId ? { projectId } : {}) }),
+})
+const result = await response.json()
+if (!response.ok || result.error) { console.error(JSON.stringify(result)); process.exitCode = 1 }
+else if (result.markdown) console.log(result.markdown)
+else console.log(JSON.stringify(result.project ? { id: result.project.id, sync: result.project.sync, jobs: result.project.jobs } : result.projects ? { projects: result.projects.map(({ id, sync }) => ({ id, sync })) } : result))

@@ -1,0 +1,35 @@
+// Sert les playlists HLS (.m3u8) en TEXTE depuis le repo content zenray-data, avec le Content-Type
+// EXIGÉ par Safari : application/vnd.apple.mpegurl. Sans ce type, Safari refuse de lire le master.
+//
+// Endpoint DÉDIÉ (clone minimal du GET de img.js) pour ZÉRO risque de régression sur /api/img :
+//   - n'accepte qu'un path commençant par pages/Videos/ et finissant par .m3u8 ;
+//   - rejette tout '..' (pas de path traversal) et tout path absolu ;
+//   - lit le blob via le token serveur (repo content peut être privé) ;
+//   - cache COURT (no-store) : une playlist peut être re-générée après re-transcodage, donc on ne la
+//     fige pas (les segments, eux, sont hashés et immutables, servis par /api/shard).
+const REPO = process.env.CONTENT_REPO || 'matthieuhuguet/zenray-data'
+const BRANCH = process.env.CONTENT_BRANCH || 'main'
+
+export default async function handler(req, res) {
+  const token = process.env.GITHUB_TOKEN
+  if (!token) return res.status(500).end()
+  if (req.method !== 'GET') { res.setHeader('Allow', 'GET'); return res.status(405).end() }
+
+  const path = (req.query.path || '').toString()
+  // Sert les manifestes texte de streaming : .m3u8 (HLS) ET .mpd (DASH, streaming v2). Même garde anti-traversal.
+  const isMpd = path.endsWith('.mpd')
+  if (!path.startsWith('pages/') || !(path.endsWith('.m3u8') || isMpd) || path.includes('..') || path.startsWith('/')) {
+    return res.status(400).end()
+  }
+  try {
+    const r = await fetch(`https://api.github.com/repos/${REPO}/contents/${encodeURI(path)}?ref=${BRANCH}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github.raw', 'User-Agent': 'zenray-progress' },
+    })
+    if (!r.ok) return res.status(r.status === 404 ? 404 : 502).end()
+    const buf = Buffer.from(await r.arrayBuffer())
+    res.setHeader('Content-Type', isMpd ? 'application/dash+xml' : 'application/vnd.apple.mpegurl')
+    res.setHeader('Cache-Control', 'no-store')
+    res.setHeader('Content-Length', String(buf.length))
+    return res.status(200).send(buf)
+  } catch { return res.status(500).end() }
+}

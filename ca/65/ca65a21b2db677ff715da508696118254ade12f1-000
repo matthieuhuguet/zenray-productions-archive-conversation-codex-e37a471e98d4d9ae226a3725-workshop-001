@@ -1,0 +1,27 @@
+import { RAW_THRESHOLD } from '../../src/config/chunkPolicy.js'
+
+/** Le navigateur classe encore les vidéos sous `hls`; l'archive conserve désormais l'original exact. */
+export function normaliserRailArchive(pipeline) {
+  return pipeline === 'hls' ? 'video' : pipeline
+}
+
+/** Les rails image et média chiffrent aujourd'hui le fichier entier en mémoire. Au-delà de la limite commune,
+ *  le rail chunk protège la sauvegarde en travaillant en flux. La vidéo brute possède déjà son flux borné. */
+export function bornerRailMemoire(pipeline, size) {
+  if (size > RAW_THRESHOLD && (pipeline === 'img' || pipeline === 'media')) return 'chunk'
+  return pipeline
+}
+
+export function shouldFlushStreamBatch(pending, batchSize, lastFlushAt, now, maxDelayMs) {
+  return pending > 0 && (pending >= batchSize || now - lastFlushAt >= maxDelayMs)
+}
+
+export function shouldFlushChunkBatch(pendingBytes, targetBytes) {
+  return pendingBytes >= targetBytes
+}
+
+export function isPermanentPushRejection(message) {
+  const normalized = String(message || '').toLowerCase().trim()
+  return normalized.length > 20
+    && /rule violation|exceeds|too large|quota|repository is over|size limit|gh0\d\d/.test(normalized)
+}

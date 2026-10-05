@@ -1,0 +1,73 @@
+import { describe, expect, it } from 'vitest'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { createDecipheriv } from 'node:crypto'
+import { commitForRepo, ingestVideoRaw, isPrivateShardName, resumableVideoShardName, videoPartsPerShard } from './video-raw-lib.mjs'
+
+describe('références du rail vidéo exact', () => {
+  it('exige le commit propre à chaque dépôt traversé', () => {
+    const sha = 'a'.repeat(40)
+    expect(commitForRepo({ 'zenrayshards-vid-01': sha }, 'zenrayshards-vid-01')).toBe(sha)
+    expect(() => commitForRepo({}, 'zenrayshards-vid-01')).toThrow('commit vidéo manquant')
+    expect(() => commitForRepo({ 'zenrayshards-vid-01': 'court' }, 'zenrayshards-vid-01')).toThrow('commit vidéo manquant')
+  })
+
+  it('garde privée toute famille sauf les images', () => {
+    expect(isPrivateShardName('zenrayshards-vid-abcdef')).toBe(true)
+    expect(isPrivateShardName('zenrayshards-img-abcdef')).toBe(false)
+  })
+
+  it('adresse chaque dépôt de reprise par la source et la tranche', () => {
+    const sourceSha256 = 'ab'.repeat(32)
+    expect(resumableVideoShardName(sourceSha256, 0)).toBe('zenrayshards-vid-file-abababababababab-01')
+    expect(resumableVideoShardName(sourceSha256, 1)).toBe('zenrayshards-vid-file-abababababababab-02')
+    expect(videoPartsPerShard()).toBeGreaterThan(1)
+  })
+
+  it('rend exactement les octets confiés et reproduit les mêmes parts après interruption', async () => {
+    const racine = await mkdtemp(path.join(tmpdir(), 'zrc-video-exact-'))
+    const source = path.join(racine, 'source.mkv')
+    const original = Buffer.from('piste-video\npiste-audio-2\nsous-titre\n')
+    const key = Buffer.alloc(32, 7)
+    process.env.ZENRAY_MEDIA_KEY = key.toString('base64')
+    await writeFile(source, original)
+    const repo = 'zenrayshards-vid-test'
+    const sha = 'c'.repeat(40)
+    const sourceSha256 = 'd'.repeat(64)
+    const executer = async () => {
+      const chiffres = [], chemins = [], indices = []
+      const vctx = {
+        vis: 'private', commitOf: {},
+        async beginFile(source) { expect(source).toBe(sourceSha256) },
+        async writePart(partPath, buf, index) {
+          chemins.push(partPath); chiffres.push(Buffer.from(buf)); indices.push(index); return repo
+        },
+        async flush() { this.commitOf[repo] = sha },
+      }
+      const resultat = await ingestVideoRaw(source, {
+        dest: 'pages/Cloud/Test', base: 'source', vctx, workDir: path.join(racine, 'work'),
+        sourceSha256, log: () => {},
+      })
+      return { ...resultat, chiffres, chemins, indices }
+    }
+    try {
+      const premier = await executer()
+      const reprise = await executer()
+      expect(reprise.chemins).toEqual(premier.chemins)
+      expect(reprise.chiffres).toEqual(premier.chiffres)
+      expect(reprise.indices).toEqual([0])
+      expect(reprise.manifest.parts.map((p) => p.iv)).toEqual(premier.manifest.parts.map((p) => p.iv))
+      const clairs = premier.chiffres.slice(0, premier.manifest.parts.length).map((cipher, i) => {
+        const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(premier.manifest.parts[i].iv, 'base64'))
+        decipher.setAuthTag(cipher.subarray(cipher.length - 16))
+        return Buffer.concat([decipher.update(cipher.subarray(0, -16)), decipher.final()])
+      })
+      expect(Buffer.concat(clairs)).toEqual(original)
+      expect(premier.manifest.name).toBe('source.mkv')
+      expect(premier.manifest.size).toBe(original.length)
+    } finally {
+      await rm(racine, { recursive: true, force: true })
+    }
+  })
+})

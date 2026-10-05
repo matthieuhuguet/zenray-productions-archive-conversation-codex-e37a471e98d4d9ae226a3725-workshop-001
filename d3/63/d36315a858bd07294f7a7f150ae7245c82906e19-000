@@ -1,0 +1,444 @@
+// video-raw-lib.mjs — VIDÉO SANS RÉENCODAGE (« chunks bruts »).
+//
+// PRINCIPE (validé 2026-06-30, remplace le DASH+HEVC trop lent) : le fichier vidéo ORIGINAL est découpé par
+// TAILLE en parts de 95 Mo (sûr sous la limite 100 Mo de raw.githubusercontent.com), poussées telles quelles
+// sur un repo public, et servies par raw.github. AUCUN ffmpeg de transcodage : juste un ffprobe (métadonnées)
+// + 1 frame poster. Qualité = source, débit = source. Upload = temps réseau seul, zéro CPU. Coût = 0.
+//
+// LECTURE côté site : Service Worker « range-shim » (P2) — le <video> natif lit une URL virtuelle, le SW
+// traduit les requêtes Range en fetch des bonnes parts. HEVC décodé par l'OS (pas les limites MSE de Chrome).
+//
+// POURQUOI raw.github et pas jsDelivr pour la vidéo : raw.github accepte 100 Mo/fichier (jsDelivr 20). On est
+// peu de requêtes (1 spectateur) donc pas de throttle. Les IMAGES, elles, restent sur jsDelivr (CDN, gère les
+// galeries 10k requêtes ; raw.github throttle les bursts).
+
+import { open, mkdir, writeFile, readFile, rm, stat } from 'node:fs/promises'
+import { existsSync, readFileSync } from 'node:fs'
+import { execFile, spawnSync } from 'node:child_process'
+import { createHash, createHmac, createCipheriv, randomBytes } from 'node:crypto'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
+import { mimeForName } from '../src/lib/fileKinds.js'
+import { loadMasterKey } from './lib/img-pipeline.mjs'
+import { RAW_CHUNK } from '../src/config/chunkPolicy.js' // 95 Mo/part (source unique chunkPolicy.js)
+import { requireCommitSha } from './lib/git-result.mjs'
+import { isPermanentPushRejection } from './lib/archive-route.mjs'
+const execFileP = promisify(execFile)
+
+const OWNER = process.env.CONTENT_OWNER || 'matthieuhuguet'
+const PART = RAW_CHUNK                    // 95 Mo : marge sûre sous la limite 100 Mo de GitHub/raw.github (source unique)
+const SHARD_CAP = (Number(process.env.ZR_SHARD_CAP_GO) || 2) * 1024 ** 3
+const REPO_CREATE_TIMEOUT_MS = Number(process.env.ZR_REPO_CREATE_TIMEOUT_MS) || 30000
+const PARTS_PAR_DEPOT = Math.max(1, Math.floor(SHARD_CAP / (PART + 16)))
+const noop = () => {}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const sha256 = (buf) => createHash('sha256').update(buf).digest('hex')
+// chemin d'adresse de contenu : ab/cd/<hash>.bin (dédup + arbo équilibrée)
+const partPathFor = (h) => `${h.slice(0, 2)}/${h.slice(2, 4)}/${h}.bin`
+const rawUrl = (repo, sha, p) => `https://raw.githubusercontent.com/${OWNER}/${repo}/${sha}/${p}`
+// mimeOf : SOURCE UNIQUE partagée avec le viewer (src/lib/fileKinds.js). Garantit que tout futur upload stocke
+// le MÊME mime que celui attendu par l'aperçu -> aucune divergence possible. Défaut application/octet-stream.
+const mimeOf = (f) => mimeForName(path.basename(f))
+
+// ── CHIFFREMENT DES PARTS (2026-07-05) ────────────────────────────────────────────────────────────────
+// AES-256-GCM, IV 12o PAR part, MÊME clé maître que le reste de l'app (chunked-media audio/PDF,
+// images privées — server/media-key.js, src/media/crypto.js) : un seul modèle de sécurité, une seule clé.
+// Le repo reste PUBLIC (raw.github), mais son contenu est illisible sans la clé -> "public + chiffré".
+// Pour une source dont le SHA-256 est connu, l'IV est dérivé par HMAC de la source, de l'index et du contenu :
+// une reprise fabrique donc le même ciphertext et retrouve le même chemin sans réenvoyer la part. Hors de ce
+// chemin prouvé, l'IV reste aléatoire. Le nom sur disque demeure le hash du CIPHERTEXT, jamais celui du clair.
+// Coût : perte du dédup inter-vidéos par contenu identique (négligeable, deux vidéos distinctes ne
+// partagent jamais de chunk 95 Mo aligné identique en pratique). Le POSTER reste EN CLAIR (affiché en
+// <img src> direct dans le Finder, un décodage async pour une simple miniature serait disproportionné).
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+let _mediaKey = null
+function mediaKey() { if (!_mediaKey) _mediaKey = loadMasterKey(REPO_ROOT, { readFileSync }); return _mediaKey }
+function encryptPart(buf, sourceSha256 = null, index = 0) {
+  // Une reprise doit produire le MÊME ciphertext et donc le MÊME chemin. L'IV reste imprévisible sans la clé,
+  // mais devient déterministe pour une part précise d'une source précise. Réutiliser cet IV ne chiffre ainsi
+  // que le même message ; deux fichiers distincts, deux positions ou deux contenus donnent un IV différent.
+  const iv = /^[0-9a-f]{64}$/i.test(sourceSha256 || '')
+    ? createHmac('sha256', mediaKey()).update('zenray-video-raw-v2\0').update(sourceSha256.toLowerCase())
+      .update(`\0${index}\0${sha256(buf)}`).digest().subarray(0, 12)
+    : randomBytes(12)
+  const c = createCipheriv('aes-256-gcm', mediaKey(), iv)
+  const cipher = Buffer.concat([c.update(buf), c.final(), c.getAuthTag()])
+  return { cipher, iv: iv.toString('base64') }
+}
+
+async function probe(file) {
+  try {
+    const { stdout } = await execFileP('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,codec_name', '-show_entries', 'format=duration', '-of', 'json', file], { timeout: 30000 })
+    const j = JSON.parse(stdout); const s = (j.streams && j.streams[0]) || {}
+    return { width: +s.width || 0, height: +s.height || 0, codec: s.codec_name || '', duration: +((j.format && j.format.duration) || 0) || 0 }
+  } catch { return { width: 0, height: 0, codec: '', duration: 0 } }
+}
+// poster : 1 frame (au milieu si durée connue), JPEG (ce ffmpeg n'a pas d'encodeur webp). Best-effort.
+async function makePoster(file, outDir, atSec) {
+  const p = path.join(outDir, 'poster.jpg')
+  try { await execFileP('ffmpeg', ['-y', '-ss', String(Math.max(0, atSec || 1)), '-i', file, '-frames:v', '1', '-vf', 'scale=640:-2', '-q:v', '3', p], { timeout: 60000 }); return existsSync(p) ? p : null } catch { return null }
+}
+
+// ── CONTEXTE SHARD VIDÉO BRUTE (arbre Git léger, push incrémental, reprise par empreinte) ─────────────────
+// Patron jumeau de makeImgShardCtx, mais privé et chiffré pour la famille vidéo. Le bulk crée UN ctx, le
+// réutilise pour chaque vidéo et le vide à la fin de chacune.
+// startShard (1-based) : index du PREMIER shard à ouvrir. >1 -> on saute les shards pleins existants et on
+// démarre sur un shard NEUF VIDE (création instantanée, ZÉRO clone de 4 Go). base : famille de repos (vidéo
+// brute par défaut ; réutilisable pour des blobs génériques 'zenray-blob-public').
+// ── MODÈLE REPRENABLE : UN FICHIER, DES DÉPÔTS DÉTERMINISTES, AUCUN BINAIRE RETÉLÉCHARGÉ ────────────────
+// Un nom aléatoire par passage rendait chaque push intermédiaire inutilisable après un crash : la vidéo
+// repartait de zéro et les gigaoctets déjà distants devenaient orphelins. Le contrat est désormais :
+//   1. Une vidéo dont l'empreinte est connue reçoit des dépôts stables `vid-file-<sha>-NN`. Une reprise retrouve
+//      donc exactement les mêmes dépôts et les mêmes parts chiffrées.
+//   2. Seuls le commit et l'arbre Git sont clonés avec `--filter=blob:none --no-checkout` ; aucune ancienne part
+//      de 95 Mo ne revient sur le Mac. Les chemins déjà présents sont sautés avant toute écriture.
+//   3. La tranche `NN` vient de l'index de la part et du plafond central SHARD_CAP : aucun calcul de taille
+//      distante ni téléchargement du dépôt n'est nécessaire.
+//   4. Les blobs sans empreinte source gardent le modèle aléatoire historique et son roulement local.
+//   5. Visibilité ENCODÉE DANS LE NOM (convention dure, utilisée par le lecteur/le SW/le téléchargement) :
+//      zenrayshards-img-* = PUBLIC (jsDelivr exige public) ; tout autre type (vid/blob/pdf/doc/...) = PRIVÉ,
+//      lu via api.github.com (Accept: raw, token) — CORS vérifié OK le 2026-07-05 (authorization autorisé).
+//   6. Ne JAMAIS recréer un repo avec un ANCIEN nom : les vieux manifestes reposent sur la redirection
+//      GitHub ancien-nom -> nouveau-nom (vérifiée OK raw.github ET jsDelivr le 2026-07-05) ; recréer l'ancien
+//      nom tuerait cette redirection.
+const SHARD_PREFIX = 'zenrayshards'
+const newShardName = (type) => `${SHARD_PREFIX}-${type}-${randomBytes(6).toString('hex')}`
+export const resumableVideoShardName = (sourceSha256, index) => {
+  if (!/^[0-9a-f]{64}$/i.test(sourceSha256 || '')) throw new Error('empreinte vidéo invalide')
+  if (!Number.isInteger(index) || index < 0) throw new Error('index de dépôt vidéo invalide')
+  return `${SHARD_PREFIX}-vid-file-${sourceSha256.slice(0, 16).toLowerCase()}-${String(index + 1).padStart(2, '0')}`
+}
+export const videoPartsPerShard = () => PARTS_PAR_DEPOT
+export const isPrivateShardName = (repo) => repo.startsWith(SHARD_PREFIX + '-') && !repo.startsWith(SHARD_PREFIX + '-img-')
+
+export function commitForRepo(commitOf, repo) {
+  const sha = commitOf && commitOf[repo]
+  if (!/^[0-9a-f]{40}$/i.test(sha || '')) throw new Error('commit vidéo manquant pour ' + repo)
+  return sha
+}
+
+export function makeVidRawShardCtx({ token, owner = OWNER, work, log = console.log, type = 'vid', vis = 'private', onPushed = noop }) {
+  const GENV = { ...process.env, GIT_TERMINAL_PROMPT: '0' }
+  const cloneUrl = (repo) => `https://x-access-token:${token}@github.com/${owner}/${repo}.git`
+  const gitRun = (a, timeout = 600000) => spawnSync('git', a, { encoding: 'utf8', env: GENV, timeout, killSignal: 'SIGKILL' })
+  const git = (dir, a, timeout = 600000) => gitRun(['-C', dir, ...a], timeout)
+  const head = (dir, label) => requireCommitSha(git(dir, ['rev-parse', 'HEAD']), label)
+  const lireArbre = (dir, arbre) => {
+    if (!arbre) return []
+    const r = git(dir, ['ls-tree', arbre])
+    if (r.status !== 0) throw new Error(`lecture arbre Git: ${(r.stderr || '').slice(-200)}`)
+    return (r.stdout || '').split('\n').filter(Boolean).map((ligne) => {
+      const m = /^(\d+)\s+(blob|tree)\s+([0-9a-f]{40})\t(.+)$/.exec(ligne)
+      if (!m) throw new Error(`entrée d'arbre Git illisible: ${ligne.slice(0, 120)}`)
+      return { mode: m[1], type: m[2], sha: m[3], name: m[4] }
+    })
+  }
+  const ecrireArbre = (dir, entrees) => {
+    const input = entrees.sort((a, b) => Buffer.from(a.name).compare(Buffer.from(b.name)))
+      .map((e) => `${e.mode} ${e.type} ${e.sha}\t${e.name}\n`).join('')
+    const r = spawnSync('git', ['-C', dir, 'mktree', '--missing'], {
+      encoding: 'utf8', env: GENV, timeout: 600000, killSignal: 'SIGKILL', input,
+    })
+    const sha = (r.stdout || '').trim()
+    if (r.status !== 0 || !/^[0-9a-f]{40}$/i.test(sha)) throw new Error(`écriture arbre Git: ${(r.stderr || '').slice(-200)}`)
+    return sha
+  }
+  const poserBlob = (dir, arbre, segments, blobSha) => {
+    const [nom, ...suite] = segments
+    const originales = lireArbre(dir, arbre)
+    const entrees = originales.filter((e) => e.name !== nom)
+    if (!suite.length) entrees.push({ mode: '100644', type: 'blob', sha: blobSha, name: nom })
+    else {
+      const ancien = originales.find((e) => e.name === nom && e.type === 'tree')
+      const enfant = poserBlob(dir, ancien?.sha || null, suite, blobSha)
+      entrees.push({ mode: '040000', type: 'tree', sha: enfant, name: nom })
+    }
+    return ecrireArbre(dir, entrees)
+  }
+  const commitStaged = (dir, chemins, message, label) => {
+    if (!chemins.length) return 'unchanged'
+    const ancien = git(dir, ['rev-parse', '--verify', 'HEAD'])
+    const ancienSha = ancien.status === 0 ? (ancien.stdout || '').trim() : null
+    const ancienArbre = ancienSha ? git(dir, ['rev-parse', 'HEAD^{tree}']) : null
+    let treeSha = ancienArbre ? (ancienArbre.stdout || '').trim() : null
+    // `git add` et `write-tree` peuvent réclamer les blobs promis d'un clone partiel. `mktree --missing`
+    // reconstruit seulement les petits objets ARBRE au-dessus du précédent et accepte que les anciens blobs
+    // restent exclusivement distants ; seul le nouveau fichier local devient un objet Git.
+    for (const chemin of chemins) {
+      const blob = git(dir, ['hash-object', '-w', '--', chemin])
+      const sha = (blob.stdout || '').trim()
+      if (blob.status !== 0 || !/^[0-9a-f]{40}$/i.test(sha)) {
+        throw new Error(`git hash ${label}: ` + (blob.stderr || '').slice(-200))
+      }
+      treeSha = poserBlob(dir, treeSha, chemin.split('/'), sha)
+    }
+    if (!treeSha || !/^[0-9a-f]{40}$/i.test(treeSha)) throw new Error(`git arbre ${label} absent`)
+    if (ancienArbre && (ancienArbre.stdout || '').trim() === treeSha) return 'unchanged'
+    const args = ['commit-tree', treeSha, ...(ancienSha ? ['-p', ancienSha] : []), '-m', message]
+    const commit = git(dir, args)
+    const commitSha = (commit.stdout || '').trim()
+    if (commit.status !== 0 || !/^[0-9a-f]{40}$/i.test(commitSha)) {
+      throw new Error(`git commit ${label}: ` + (commit.stderr || commit.stdout || 'sans message').slice(-200))
+    }
+    const maj = git(dir, ['update-ref', 'HEAD', commitSha, ...(ancienSha ? [ancienSha] : [])])
+    if (maj.status !== 0) throw new Error(`git ref ${label}: ` + (maj.stderr || '').slice(-200))
+    return 'committed'
+  }
+  const ctx = { type, vis, repo: null, dir: null, bytes: 0, pendingBytes: 0, pendingPaths: [],
+    remotePaths: new Set(), commitOf: {}, sourceSha256: null }
+
+  const configurerDepot = () => {
+    git(ctx.dir, ['config', 'user.email', 'bot@zenray']); git(ctx.dir, ['config', 'user.name', 'zenray-bot'])
+    git(ctx.dir, ['config', 'http.version', 'HTTP/1.1']); git(ctx.dir, ['config', 'http.postBuffer', '524288000'])
+  }
+
+  async function depotExiste(repo) {
+    const r = spawnSync('curl', ['-sS', '--max-time', String(Math.ceil(REPO_CREATE_TIMEOUT_MS / 1000)),
+      '-o', '/dev/null', '-w', '%{http_code}', '-H', `Authorization: Bearer ${token}`,
+      `https://api.github.com/repos/${owner}/${repo}`], {
+      encoding: 'utf8', env: GENV, timeout: REPO_CREATE_TIMEOUT_MS, killSignal: 'SIGKILL',
+    })
+    if (r.status !== 0) throw new Error(`sonde repo ${repo}: ${(r.stderr || 'échec réseau').slice(-160)}`)
+    const code = (r.stdout || '').trim()
+    if (code === '200') return true
+    if (code === '404') return false
+    throw new Error(`sonde repo ${repo}: HTTP ${code || '?'}`)
+  }
+
+  async function openShard(nomImpose = null) {
+    ctx.repo = nomImpose || newShardName(ctx.type)
+    ctx.dir = path.join(work, ctx.repo)
+    await rm(ctx.dir, { recursive: true, force: true })
+    await mkdir(work, { recursive: true })
+    const existe = nomImpose ? await depotExiste(ctx.repo) : false
+    if (existe) {
+      const refs = gitRun(['ls-remote', '-q', cloneUrl(ctx.repo), 'refs/heads/main'], REPO_CREATE_TIMEOUT_MS)
+      if (refs.status !== 0) throw new Error(`lecture repo ${ctx.repo}: ${(refs.stderr || '').slice(-200)}`)
+      if (/^[0-9a-f]{40}\s/m.test(refs.stdout || '')) {
+        const cl = gitRun(['clone', '-q', '--filter=blob:none', '--no-checkout', '--depth', '1',
+          '--single-branch', '--branch', 'main', cloneUrl(ctx.repo), ctx.dir], 120000)
+        if (cl.status !== 0) throw new Error(`reprise repo ${ctx.repo}: ${(cl.stderr || '').slice(-200)}`)
+        configurerDepot()
+        const arbre = git(ctx.dir, ['ls-tree', '-r', '--name-only', 'HEAD'])
+        if (arbre.status !== 0) throw new Error(`inventaire repo ${ctx.repo}: ${(arbre.stderr || '').slice(-200)}`)
+        ctx.remotePaths = new Set((arbre.stdout || '').split('\n').filter(Boolean))
+        ctx.commitOf[ctx.repo] = head(ctx.dir, ctx.repo)
+        ctx.bytes = [...ctx.remotePaths].filter((p) => p.endsWith('.bin')).length * (PART + 16)
+        ctx.pendingBytes = 0; ctx.pendingPaths = []
+        log(`  >>> repo ${ctx.repo} repris sans ses binaires (${ctx.remotePaths.size} chemin(s) distant(s))`)
+        return
+      }
+    }
+    await mkdir(ctx.dir, { recursive: true })
+    git(ctx.dir, ['init', '-q']); git(ctx.dir, ['branch', '-M', 'main'])
+    await writeFile(path.join(ctx.dir, 'README.md'), `# zenrayshards (${ctx.type}, ${ctx.vis})\n\nParts de 95 Mo, chiffrees AES-256-GCM, nommees par empreinte. Manifeste sur zenray-data.\n`)
+    if (!existe) {
+      const cr = spawnSync('curl', ['-s', '--max-time', String(Math.ceil(REPO_CREATE_TIMEOUT_MS / 1000)), '-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST', '-H', `Authorization: Bearer ${token}`, 'https://api.github.com/user/repos', '-d', JSON.stringify({ name: ctx.repo, private: ctx.vis === 'private' })], {
+        encoding: 'utf8', env: GENV, timeout: REPO_CREATE_TIMEOUT_MS, killSignal: 'SIGKILL',
+      })
+      if ((cr.stdout || '').trim() !== '201') throw new Error(`création repo ${ctx.repo}: HTTP ${(cr.stdout || '?')}`)
+    }
+    configurerDepot()
+    commitStaged(ctx.dir, ['README.md'], 'init', 'initial vidéo')
+    git(ctx.dir, ['remote', 'add', 'origin', cloneUrl(ctx.repo)])
+    const ps = git(ctx.dir, ['push', '-q', 'origin', 'HEAD:main'], 120000)
+    if (ps.status !== 0) throw new Error('push-init shard: ' + (ps.stderr || '').slice(-200))
+    ctx.commitOf[ctx.repo] = head(ctx.dir, ctx.repo)
+    ctx.remotePaths = new Set(['README.md'])
+    log(`  >>> repo neuf ${ctx.repo} (${ctx.vis}) créé`)
+    ctx.bytes = 0; ctx.pendingBytes = 0; ctx.pendingPaths = []
+  }
+
+  async function pushShard() {
+    const aEnvoyer = ctx.pendingBytes, chemins = ctx.pendingPaths.slice()
+    if (!chemins.length) return true
+    // Un arbre local inchangé ne prouve pas que son HEAD est déjà distant. Après douze refus réseau, le commit
+    // existe encore localement et les mêmes chemins restent en attente ; il faut donc toujours retenter le push.
+    commitStaged(ctx.dir, chemins, '+vidraw', 'vidéo')
+    for (let a = 0; a < 12; a++) {
+      const ps = git(ctx.dir, ['push', '-q', 'origin', 'HEAD:main'], 1800000)
+      if (ps.status === 0) {
+        for (const p of chemins) ctx.remotePaths.add(p)
+        ctx.pendingBytes = 0; ctx.pendingPaths = []; onPushed(aEnvoyer); return true
+      }
+      const message = ((ps.stderr || '') + (ps.stdout || '')).trim()
+      if (isPermanentPushRejection(message)) throw new Error(`push-refus-definitif ${ctx.repo}: ${message.slice(-120)}`)
+      log(`  vidraw push retry ${a + 1}/12 ${message.slice(-120)}`)
+      await sleep(Math.min(60000, 3000 * (a + 1)))
+    }
+    return false
+  }
+
+  // Écrit une part (déjà hachée) dans le clone. Rollover AVANT écriture si le shard atteint le cap. Push
+  // incrémental tous les ~900 Mo (anti-RAM, anti-packfile géant). Renvoie le repo où elle a atterri.
+  //
+  // SEUIL 900 Mo (2026-07-11, relevé depuis 400 Mo, demande Matthieu de pousser plus gros pour aller plus
+  // vite). ATTENTION AU PLAFOND RÉEL : img-pipeline.mjs documente un incident DÉJÀ VÉCU — un push unique de
+  // plusieurs Go HANG (git reste à 0% CPU, aucun timeout ne le rattrape avant l'échéance de 30 min ci-dessous)
+  // -> règle éprouvée « rester sous 1 Go/commit ». Matthieu proposait 1900 Mo en pensant une limite GitHub à
+  // 2000 Mo : cette limite n'existe nulle part dans ce projet ni dans la doc GitHub — le seul plafond RÉEL et
+  // TESTÉ ici est <1 Go. 900 Mo reste sous cette marge de sécurité tout en coupant le nombre de push d'un gros
+  // lot vidéo de plus de moitié vs 400 Mo (ex. 53 Go/900 Mo ≈ 60 push contre 133 à 400 Mo). AUCUN effet sur la
+  // visibilité média-par-média : le manifeste vidéo n'est de toute façon committé qu'UNE fois par vidéo (flush
+  // final ci-dessous), ce seuil ne pilote QUE les push intermédiaires PENDANT l'écriture d'UNE SEULE vidéo.
+  async function writePart(hashedPath, buf, partIndex = null) {
+    if (ctx.sourceSha256 && Number.isInteger(partIndex) && partIndex >= 0) {
+      const voulu = resumableVideoShardName(ctx.sourceSha256, Math.floor(partIndex / PARTS_PAR_DEPOT))
+      if (ctx.repo !== voulu) {
+        if (ctx.repo) await flush()
+        await openShard(voulu)
+      }
+    } else if (!ctx.repo) await openShard()
+    // Découpage ANTICIPÉ (avant le push de la part, jamais de question à GitHub) : si cette part ferait
+    // dépasser le plafond au repo courant, on pousse ce qui est en attente et on ouvre un AUTRE repo neuf.
+    if (!ctx.sourceSha256 && ctx.bytes > 0 && ctx.bytes + buf.length > SHARD_CAP) {
+      if (!await pushShard()) throw new Error('push-incr vidraw')
+      ctx.commitOf[ctx.repo] = head(ctx.dir, ctx.repo)
+      await openShard()
+    }
+    if (ctx.remotePaths.has(hashedPath)) return ctx.repo
+    const dst = path.join(ctx.dir, hashedPath)
+    await mkdir(path.dirname(dst), { recursive: true })
+    await writeFile(dst, buf)
+    ctx.bytes += buf.length; ctx.pendingBytes += buf.length; ctx.pendingPaths.push(hashedPath)
+    if (ctx.pendingBytes >= 900 * 1024 * 1024) { if (!await pushShard()) throw new Error('push-incr vidraw') }
+    return ctx.repo
+  }
+
+  async function beginFile(sourceSha256 = null) {
+    if (ctx.repo) await flush()
+    ctx.repo = null; ctx.dir = null; ctx.bytes = 0; ctx.pendingBytes = 0; ctx.pendingPaths = []
+    ctx.remotePaths = new Set()
+    ctx.sourceSha256 = /^[0-9a-f]{64}$/i.test(sourceSha256 || '') ? sourceSha256.toLowerCase() : null
+  }
+
+  async function flush() {
+    if (ctx.dir && existsSync(ctx.dir)) {
+      const avaitAttente = ctx.pendingPaths.length > 0
+      if (!await pushShard()) throw new Error('push-final vidraw ' + ctx.repo)
+      ctx.commitOf[ctx.repo] = head(ctx.dir, ctx.repo)
+      if (avaitAttente) log(`  ✓ ${ctx.repo} poussé (commit ${(ctx.commitOf[ctx.repo] || '').slice(0, 7)})`)
+    }
+  }
+  ctx.openShard = openShard; ctx.beginFile = beginFile; ctx.writePart = writePart
+  ctx.flush = flush
+  return ctx
+}
+
+// ── INGESTION D'UNE VIDÉO BRUTE ───────────────────────────────────────────────────────────────────────
+// Découpe le fichier ORIGINAL en parts de 95 Mo (lecture streamée, anti-OOM), les pousse via le ctx shard,
+// pousse le poster, et renvoie le manifeste .media.json (type 'video-raw') prêt à committer sur zenray-data.
+// CONFIRMÉ EN LIGNE = ce manifeste committé (le bulk le fait), pas avant. URLs raw.github pinnées sur le commit.
+export async function ingestVideoRaw(file, { dest, base, vctx, posterCtx = null, workDir = '/tmp/zr_vidraw',
+  sourceSha256 = null, log = noop }) {
+  await vctx.beginFile?.(sourceSha256)
+  const p = await probe(file)
+  const outDir = path.join(workDir, base.replace(/[^\w.-]/g, '_') + '-' + Date.now().toString(36))
+  await mkdir(outDir, { recursive: true })
+
+  // Le fichier du Mac reste l'unique source. Aucun remux ne déplace son index et aucune piste n'est retirée :
+  // la concaténation des parts déchiffrées rend exactement les octets confiés à ZenRayCloud.
+  const srcFile = file
+  const total = (await stat(srcFile)).size
+  const nParts = Math.ceil(total / PART)
+  log(`${base} — ${(total / 1073741824).toFixed(2)} Go, ${p.width}x${p.height} ${p.codec}, ${nParts} parts de 95 Mo (AUCUN réencodage)`)
+
+  // 1) poster (1 frame, best-effort) depuis l'original
+  const posterFile = await makePoster(file, outDir, p.duration ? p.duration / 2 : 1)
+
+  // 2) split streamé du fichier (faststart) + push part par part (jamais le fichier entier en RAM)
+  const parts = []           // { idx, repo, path, hash, size, iv }
+  const fd = await open(srcFile, 'r')
+  const b = Buffer.alloc(PART)
+  try {
+    let off = 0, idx = 0
+    while (off < total) {
+      const { bytesRead } = await fd.read(b, 0, PART, off)
+      if (!bytesRead) break
+      const slice = Buffer.from(b.subarray(0, bytesRead)) // copie : writePart est async, on réutilise b
+      const { cipher, iv } = encryptPart(slice, sourceSha256, idx)
+      const h = sha256(cipher); const hp = partPathFor(h) // adressé par hash du CIPHERTEXT (jamais du clair)
+      const repo = await vctx.writePart(hp, cipher, idx)
+      parts.push({ idx, repo, path: hp, hash: h, size: bytesRead, iv })
+      off += bytesRead; idx++
+      if (idx % 5 === 0 || off >= total) log(`  part ${idx}/${nParts} (${(off / 1073741824).toFixed(2)}/${(total / 1073741824).toFixed(2)} Go)`)
+    }
+  } finally { await fd.close() }
+
+  // poster en part raw (simple, toujours dispo) — petit, va dans le shard courant
+  let posterPart = null
+  if (posterFile) {
+    try {
+      const pb = await readFile(posterFile)
+      const h = sha256(pb); const hp = `${h.slice(0, 2)}/${h.slice(2, 4)}/${h}.jpg`
+      const repo = await vctx.writePart(hp, pb)
+      posterPart = { repo, path: hp }
+    } catch (e) { log(`  ⚠ poster: ${(e.message || e).toString().slice(0, 80)}`) }
+  }
+
+  // 3) flush du shard -> commit SHA connu -> URLs raw.github pinnées
+  await vctx.flush()
+  const shaOf = (repo) => commitForRepo(vctx.commitOf, repo)
+  const isPriv = vctx.vis === 'private'
+  const partUrls = parts.map((pt) => rawUrl(pt.repo, shaOf(pt.repo), pt.path))
+  // POSTER sur repo PRIVÉ : un <img src> ne peut pas porter de header d'authentification -> l'URL stockée
+  // dans le manifeste passe par /api/raw-proxy (le serveur, qui a le token, va chercher l'image et la sert
+  // même-origine). Petit fichier (~50 Ko), zéro impact bande passante notable. Repo public : URL raw directe.
+  const posterRaw = posterPart ? rawUrl(posterPart.repo, shaOf(posterPart.repo), posterPart.path) : null
+  const posterUrl = posterRaw ? (isPriv ? `/api/raw-proxy?u=${encodeURIComponent(posterRaw)}` : posterRaw) : null
+
+  // 4) manifeste .media.json (type 'video-raw'). offsets cumulés (EN CLAIR) -> le Service Worker mappe un
+  // Range -> part(s), déchiffre chaque part avec son iv, PUIS applique ces offsets sur le clair obtenu.
+  // private:true -> le lecteur (SW) et le téléchargement convertissent chaque URL raw en appel
+  // api.github.com (Accept: raw + token via /api/raw-token) — le repo est invisible/illisible publiquement.
+  let acc = 0
+  const partsMeta = parts.map((pt) => { const start = acc; acc += pt.size; return { url: partUrls[pt.idx], start, end: acc - 1, size: pt.size, iv: pt.iv } })
+  const manifest = {
+    type: 'video-raw', v: 1, name: path.basename(file), mime: mimeOf(file),
+    size: total, codec: p.codec, width: p.width, height: p.height, duration: p.duration,
+    parts: partsMeta, poster: posterUrl,
+    enc: true, alg: 'AES-GCM', // chaque part est chiffrée (iv par part ci-dessus) ; poster = clair (voir plus haut)
+    ...(isPriv ? { private: true } : {}),
+  }
+  const manifestPath = `${dest}/${base}.${path.basename(file).split('.').pop().toLowerCase()}.media.json`
+  await rm(outDir, { recursive: true, force: true }).catch(() => {})
+  return { manifestPath, manifest, posterUrl }
+}
+
+// ── INGESTION D'UN FICHIER QUELCONQUE (blob brut) ──────────────────────────────────────────────────────
+// Pour les fichiers NON ouvrables directement sur le site (wav, py, cube, zip, …) : on découpe le fichier
+// ORIGINAL en parts de 95 Mo (aucune transformation), on les pousse via le ctx shard, et on renvoie un
+// manifeste .file.json (type 'blob-raw'). Le téléchargement recolle les parts dans l'ordre = fichier BIT À BIT
+// identique (offsets cumulés + tailles + empreinte par part). Aucune perte. URLs raw.github pinnées sur commit.
+export async function ingestBlobRaw(file, { dest, base, vctx, log = noop }) {
+  const total = (await stat(file)).size
+  const nParts = Math.ceil(total / PART) || 1
+  log(`${base} — ${(total / 1048576).toFixed(1)} Mo, ${nParts} part(s) de 95 Mo (fichier brut, aucune transformation)`)
+  const parts = []
+  const fd = await open(file, 'r')
+  const b = Buffer.alloc(PART)
+  try {
+    let off = 0, idx = 0
+    while (off < total) {
+      const { bytesRead } = await fd.read(b, 0, PART, off)
+      if (!bytesRead) break
+      const slice = Buffer.from(b.subarray(0, bytesRead))
+      const h = sha256(slice); const hp = partPathFor(h)
+      const repo = await vctx.writePart(hp, slice)
+      parts.push({ idx, repo, path: hp, hash: h, size: bytesRead })
+      off += bytesRead; idx++
+    }
+  } finally { await fd.close() }
+  if (!total) { // fichier vide : une part vide pour cohérence
+    const h = sha256(Buffer.alloc(0)); const hp = partPathFor(h)
+    const repo = await vctx.writePart(hp, Buffer.alloc(0)); parts.push({ idx: 0, repo, path: hp, hash: h, size: 0 })
+  }
+  await vctx.flush()
+  const shaOf = (repo) => commitForRepo(vctx.commitOf, repo)
+  let acc = 0
+  const partsMeta = parts.map((pt) => { const start = acc; acc += pt.size; return { url: rawUrl(pt.repo, shaOf(pt.repo), pt.path), start, end: acc - 1, size: pt.size, sha256: pt.hash } })
+  const manifest = { type: 'blob-raw', v: 1, name: path.basename(file), mime: mimeOf(file), size: total, parts: partsMeta, ...(vctx.vis === 'private' ? { private: true } : {}) }
+  const manifestPath = `${dest}/${path.basename(file)}.file.json`
+  return { manifestPath, manifest }
+}

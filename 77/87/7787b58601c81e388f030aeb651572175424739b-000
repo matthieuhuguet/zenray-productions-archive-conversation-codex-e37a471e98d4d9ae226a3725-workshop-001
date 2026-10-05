@@ -1,0 +1,130 @@
+// 2 October 2026, 13:12 CEST: human prompts and final iterations append once to their bound project feedback.
+import { createReadStream } from 'node:fs'
+import { readdir, readFile, stat, open } from 'node:fs/promises'
+import { createInterface } from 'node:readline'
+import { createHash } from 'node:crypto'
+import path from 'node:path'
+import { spawn } from 'node:child_process'
+
+export function transcriptEntry(record) {
+  if (record.type === 'event_msg' && record.payload?.type === 'task_complete' && !record.payload.error && record.payload.last_agent_message?.trim()) return { text: record.payload.last_agent_message.trim(), kind: 'iteration', timestamp: record.timestamp }
+  const payload = record.type === 'response_item' ? record.payload : record.message
+  if (!payload || !['user', 'assistant'].includes(payload.role)) return null
+  if (payload.role === 'assistant' && payload.phase !== 'final_answer' && payload.channel !== 'final' && record.type !== 'assistant') return null
+  const parts = typeof payload.content === 'string' ? [payload.content] : (payload.content || []).filter((part) => ['input_text', 'output_text', 'text'].includes(part.type)).map((part) => part.text)
+  const text = parts.filter(Boolean).join('\n').trim()
+  if (!text || /^# AGENTS\.md instructions|^<environment_context>|^<system-reminder>|^<subagent_notification>|^<turn_aborted>|^<skill>/i.test(text)) return null
+  return { text, kind: payload.role === 'user' ? 'prompt' : 'iteration', timestamp: record.timestamp }
+}
+
+export function matchFeedbackProject(cwd, projects) {
+  if (!cwd) return null
+  const matches = projects.flatMap((project) => project.sources.filter((source) => {
+    const root = path.resolve(source.localPath)
+    const target = path.resolve(cwd)
+    if (target !== root && !target.startsWith(`${root}/`)) return false
+    if (!source.include) return true
+    return source.include.some((entry) => target === path.join(root, entry) || target.startsWith(path.join(root, entry) + '/'))
+  }).map((source) => ({ id: project.id, depth: source.localPath.length })))
+  if (!matches.length) return null
+  const depth = Math.max(...matches.map((match) => match.depth))
+  const ids = [...new Set(matches.filter((match) => match.depth === depth).map((match) => match.id))]
+  return ids.length === 1 ? ids[0] : null
+}
+
+export async function createFeedbackCapture({ config, projects, atomicJson, home = process.env.HOME, onError = () => {}, onStatus = () => {} }) {
+  const stateFile = path.join(config.storage.stateDir, 'TranscriptCursors.json')
+  let cursors = {}
+  try { cursors = JSON.parse(await readFile(stateFile, 'utf8')) } catch (error) { if (error.code !== 'ENOENT') throw error }
+  let busy = false, closed = false, timer
+  const writer = config.storage.feedbackWriter
+  const roots = [path.join(home, '.codex/sessions'), path.join(home, '.claude/projects')]
+  const files = async (directory, found = []) => {
+    let entries
+    try { entries = await readdir(directory, { withFileTypes: true }) } catch (error) { if (error.code === 'ENOENT') return found; throw error }
+    for (const entry of entries) {
+      const filename = path.join(directory, entry.name)
+      if (entry.isDirectory()) await files(filename, found)
+      else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        const info = await stat(filename)
+        if (info.mtimeMs >= Date.now() - 86400000 || cursors[filename]) found.push({ filename, info })
+      }
+    }
+    return found
+  }
+  const append = (project, entry, eventId, source) => new Promise((resolve, reject) => {
+    const child = spawn('python3', [writer, 'add', project.id, entry.text, '--file', project.feedbackPath,
+      '--kind', entry.kind, '--event-id', eventId, ...(entry.timestamp ? ['--timestamp', entry.timestamp] : []), '--source', source, '--json'], { stdio: ['ignore', 'ignore', 'pipe'] })
+    let failure = ''; child.stderr.on('data', (data) => { failure += String(data) })
+    child.on('error', reject); child.on('close', (code) => code === 0 ? resolve() : reject(new Error(failure.slice(0, 200))))
+  })
+  const drain = async () => {
+    if (closed || busy) return
+    busy = true
+    const failures = []
+    const reportError = (error) => { failures.push(error.message); onError(error) }
+    try {
+      let bindings = {}
+      try { bindings = JSON.parse(await readFile(path.join(config.storage.stateDir, 'SessionBindings.json'), 'utf8')) } catch (error) { if (error.code !== 'ENOENT') throw error }
+      const candidates = (await Promise.all(roots.map((root) => files(root)))).flat()
+      candidates.sort((left, right) => Number(!left.filename.includes(Object.keys(bindings)[0] || '\0')) - Number(!right.filename.includes(Object.keys(bindings)[0] || '\0')))
+      for (const { filename, info } of candidates) {
+        try {
+          let cursor = cursors[filename] || { offset: 0, cwd: null, sessionId: null }
+          if (info.size < cursor.offset) throw new Error('Transcript shrank; original capture cursor retained')
+          if (info.size === cursor.offset) continue
+          if (!cursor.cwd || !cursor.sessionId) {
+            const descriptor = await open(filename, 'r'), prefix = Buffer.alloc(Math.min(info.size, 65536))
+            try { await descriptor.read(prefix, 0, prefix.length, 0) } finally { await descriptor.close() }
+            const beginning = prefix.toString('utf8')
+            cursor.cwd ||= beginning.match(/"cwd"\s*:\s*"([^"\n]+)"/)?.[1]
+            cursor.sessionId ||= beginning.match(/"sessionId"\s*:\s*"([^"\n]+)"/)?.[1] || beginning.match(/"id"\s*:\s*"([^"\n]+)"/)?.[1]
+          }
+          if (!bindings[cursor.sessionId] && !matchFeedbackProject(cursor.cwd, projects())) {
+            // 3 October 2026, 22:23 CEST: an unbound session keeps unread history available when its real identity is linked later.
+            cursors[filename] = cursor; continue
+          }
+          const stream = createReadStream(filename, { start: cursor.offset, end: info.size - 1 })
+          const lines = createInterface({ input: stream, crlfDelay: Infinity })
+          let consumed = cursor.offset
+          try {
+            for await (const line of lines) {
+              const bytes = Buffer.byteLength(line, 'utf8') + 1
+              if (consumed + bytes > info.size) break
+              consumed += bytes
+              if (!line || !/"(?:type|role)"\s*:\s*"(?:session_meta|message|user|assistant|task_complete)"/.test(line.slice(0, 4096))) continue
+              const record = JSON.parse(line)
+              if (record.type === 'session_meta') { cursor.cwd = record.payload.cwd; cursor.sessionId = record.payload.id }
+              cursor.cwd ||= record.cwd
+              cursor.sessionId ||= record.sessionId
+              const entry = transcriptEntry(record)
+              if (!entry) continue
+              // 3 October 2026, 22:23 CEST: delegated instructions retain agent provenance instead of pretending to be human prompts.
+              const subagentId = record.isSidechain && record.agentId ? record.agentId : null
+              if (subagentId && entry.kind === 'prompt') entry.kind = 'order'
+              const projectId = bindings[cursor.sessionId] || matchFeedbackProject(cursor.cwd, projects())
+              const project = projects().find((item) => item.id === projectId)
+              if (!project?.feedbackPath) continue
+              const eventId = 'transcript:' + createHash('sha256').update(`${cursor.sessionId}:${subagentId ? `${subagentId}:` : ''}${record.timestamp}:${entry.kind}:${entry.text}`).digest('hex')
+              await append(project, entry, eventId, filename)
+            }
+          } finally { lines.close(); stream.destroy() }
+          cursors[filename] = { ...cursor, offset: consumed }
+          await atomicJson(stateFile, cursors)
+        } catch (error) {
+          // 3 October 2026, 03:47 CEST: retain the failing cursor and continue collecting independent project sessions.
+          reportError(new Error(`Transcript capture failed for ${filename}: ${error.message}`, { cause: error }))
+        }
+      }
+      await atomicJson(stateFile, cursors)
+    // 3 October 2026, 03:50 CEST: publish current collection health after each scan, including recovery.
+    } catch (error) { reportError(error) } finally { busy = false; onStatus({ error: failures.join('; ') || null, checkedAt: new Date().toISOString() }) }
+  }
+  timer = setInterval(drain, 5000); timer.unref?.()
+  return { drain, replay: async (sessionId) => {
+    if (busy) throw new Error('Transcript capture is active; retry the session binding')
+    for (const cursor of Object.values(cursors)) if (cursor.sessionId === sessionId) cursor.offset = 0
+    await atomicJson(stateFile, cursors)
+    await drain()
+  }, close: () => { closed = true; clearInterval(timer) } }
+}

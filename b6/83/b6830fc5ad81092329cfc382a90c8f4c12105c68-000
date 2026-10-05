@@ -1,0 +1,32 @@
+import { describe, expect, it } from 'vitest'
+import { resolveImgManifest } from './img-ingest.mjs'
+
+const principal = 'a'.repeat(40)
+const vignette = 'b'.repeat(40)
+const base = {
+  path: 'pages/Cloud/Photos/photo.jpg.img.json', repo: 'images-01', cdnChunks: ['aa/original.bin'],
+  iv: 'iv', thumbIv: 'thumb-iv', thumbPath: 'bb/thumb.webp', thumbW: 800, thumbH: 600,
+  base: { name: 'photo.jpg', ext: 'jpg', w: 4000, h: 3000, clearSize: 1234 },
+}
+
+describe('résolution du manifeste image', () => {
+  it('pointe la vignette vers le dépôt où elle a réellement roulé', () => {
+    const blob = resolveImgManifest({ ...base, thumbRepo: 'images-02' }, {
+      owner: 'matthieuhuguet', commitOf: { 'images-01': principal, 'images-02': vignette },
+    })
+    expect(JSON.parse(blob.content).thumb).toContain(`images-02@${vignette}/bb/thumb.webp`)
+  })
+
+  it('garde le dépôt principal quand la vignette ne roule pas', () => {
+    const blob = resolveImgManifest(base, {
+      owner: 'matthieuhuguet', commitOf: { 'images-01': principal },
+    })
+    expect(JSON.parse(blob.content).thumb).toContain(`images-01@${principal}/bb/thumb.webp`)
+  })
+
+  it('refuse une vignette dont le commit distant manque', () => {
+    expect(() => resolveImgManifest({ ...base, thumbRepo: 'images-02' }, {
+      owner: 'matthieuhuguet', commitOf: { 'images-01': principal },
+    })).toThrow('commit vignette manquant')
+  })
+})
