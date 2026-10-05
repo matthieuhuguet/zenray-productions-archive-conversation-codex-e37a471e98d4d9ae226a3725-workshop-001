@@ -1,0 +1,147 @@
+// 2026-09-12 ZenRay Freelance v2: the studios to contact, the ones already contacted, the exact
+// message that was sent, and the dated trail of every state change.
+//
+// FR : les studios a contacter, ceux deja contactes, le message exact qui a ete envoye, et la trace
+// datee de chaque changement d'etat.
+//
+// Pure module: strings, dates and objects only, no browser API, so the whole model is testable.
+// Every write returns a NEW studio: the stored history is append-only, exactly like PROGRESS.md.
+// FR : module pur, chaque ecriture rend un NOUVEAU studio et l'historique ne se reecrit jamais.
+import { UI } from '../config/colors.js'
+
+/** The pipeline, in order. Keys are written into the data and never change; labels are shown. */
+export const STATUSES = [
+  { key: 'to_contact', label: 'À contacter', color: UI.gray },
+  { key: 'contacted', label: 'Contacté', color: UI.orange },
+  { key: 'replied', label: 'A répondu', color: UI.blue },
+  { key: 'interview', label: 'Entretien', color: UI.purple },
+  { key: 'offer', label: 'Offre reçue', color: UI.green },
+  { key: 'declined', label: 'Refusé', color: UI.red },
+  { key: 'archived', label: 'Archivé', color: UI.yellow },
+]
+const BY_KEY = Object.fromEntries(STATUSES.map((s) => [s.key, s]))
+/** A status is "contacted" from the moment a message left: the dot turns on at the first message. */
+export const CONTACTED_FROM = ['contacted', 'replied', 'interview', 'offer', 'declined']
+
+// The legacy French statuses of the 2026 application tracker, kept readable forever.
+const LEGACY_STATUS = { 'Postulé': 'contacted', 'Relancé': 'contacted', 'Entretien': 'interview', 'Offre reçue': 'offer', 'Refusé': 'declined', 'Abandonné': 'archived' }
+
+export const isoDay = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+
+const MONTHS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre']
+/** `2026-09-12` or `2026-09-12T08:30:00Z` become `12 septembre 2026`. */
+export const readableDate = (iso) => (!iso || String(iso).length < 10) ? '' : `${Number(String(iso).slice(8, 10))} ${MONTHS[Number(String(iso).slice(5, 7)) - 1]} ${String(iso).slice(0, 4)}`
+
+export const statusOf = (studio) => BY_KEY[studio && studio.status] || BY_KEY.to_contact
+export const statusLabel = (key) => (BY_KEY[key] || BY_KEY.to_contact).label
+export const statusColor = (key) => (BY_KEY[key] || BY_KEY.to_contact).color
+
+/** One studio, from either schema. Unknown shapes rejected rather than half read. */
+export function normalizeStudio(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  const name = String(raw.name || raw.company || '').trim()
+  if (!name) return null
+  const status = BY_KEY[raw.status] ? raw.status : (LEGACY_STATUS[raw.status] || 'to_contact')
+  const messages = (Array.isArray(raw.messages) ? raw.messages : [])
+    .map((m) => ({ at: String(m.at || ''), channel: String(m.channel || 'mail'), text: String(m.text || '') }))
+    .filter((m) => m.text)
+    .sort((a, b) => String(a.at).localeCompare(String(b.at)))
+  const history = (Array.isArray(raw.history) ? raw.history : [])
+    .map((h) => ({ at: String(h.at || ''), from: String(h.from || ''), to: String(h.to || ''), note: String(h.note || '') }))
+    .filter((h) => h.to)
+  return {
+    ...raw,
+    id: String(raw.id || `s${Date.now()}${Math.random().toString(36).slice(2, 6)}`),
+    name,
+    role: String(raw.role || '').trim(),
+    link: String(raw.link || '').trim(),
+    city: String(raw.city || '').trim(),
+    status,
+    createdAt: String(raw.createdAt || raw.date || ''),
+    contactedAt: String(raw.contactedAt || (CONTACTED_FROM.includes(status) ? (raw.date || '') : '')),
+    messages,
+    history,
+    notes: String(raw.notes || ''),
+    offerDetailsPath: String(raw.offerDetailsPath || ''),
+  }
+}
+
+/** The whole file, from v1 (`applications`) or v2 (`studios`). Never throws on a broken file. */
+export function normalizeStore(json) {
+  const src = json && typeof json === 'object' ? json : {}
+  const list = Array.isArray(src.studios) ? src.studios : (Array.isArray(src.applications) ? src.applications : [])
+  return { ...src, v: 2, studios: list.map(normalizeStudio).filter(Boolean) }
+}
+
+// 30 September 2026, 19:45 Europe/Paris: Merge only the edited fields into the current drive record.
+export function applyStudioChange(current, before, next) {
+  const remote = current.studios.find((studio) => studio.id === next.id)
+  if (!remote) throw new Error('Cette fiche a été supprimée. Recharge la liste avant de la modifier.')
+  const changed = { ...remote }
+  for (const key of Object.keys(next)) {
+    if (JSON.stringify(before[key]) === JSON.stringify(next[key])) continue
+    if (key === 'messages' || key === 'history') {
+      const original = new Set(before[key].map((item) => JSON.stringify(item)))
+      const existing = new Set(remote[key].map((item) => JSON.stringify(item)))
+      changed[key] = [...remote[key], ...next[key].filter((item) => !original.has(JSON.stringify(item)) && !existing.has(JSON.stringify(item)))]
+    } else {
+      if (JSON.stringify(remote[key]) !== JSON.stringify(before[key]) && JSON.stringify(remote[key]) !== JSON.stringify(next[key])) {
+        throw new Error('Cette fiche a changé dans un autre onglet. Recharge-la avant de modifier ce champ.')
+      }
+      changed[key] = next[key]
+    }
+  }
+  return { ...current, studios: current.studios.map((studio) => studio.id === next.id ? changed : studio) }
+}
+
+/** A status change is an EVENT: the previous state stays readable, it is never overwritten. */
+export function setStatus(studio, next, at = isoDay(), note = '') {
+  if (!BY_KEY[next] || studio.status === next) return studio
+  const contactedAt = studio.contactedAt || (CONTACTED_FROM.includes(next) ? at : '')
+  return { ...studio, status: next, contactedAt, history: [...studio.history, { at, from: studio.status, to: next, note }] }
+}
+
+/** Recording the message that was really sent, which is the whole point of the backup. */
+export function addMessage(studio, { text, channel = 'mail', at = isoDay() }) {
+  const body = String(text || '').trim()
+  if (!body) return studio
+  const withMsg = { ...studio, messages: [...studio.messages, { at, channel, text: body }] }
+  return studio.status === 'to_contact' ? setStatus(withMsg, 'contacted', at, 'premier message') : withMsg
+}
+
+export const lastMessage = (studio) => (studio.messages.length ? studio.messages[studio.messages.length - 1] : null)
+
+/** Sections of the dashboard, in pipeline order, empty ones dropped. */
+export function groupByStatus(studios) {
+  return STATUSES
+    .map((s) => ({ key: s.key, label: s.label, color: s.color, items: studios.filter((x) => x.status === s.key) }))
+    .filter((g) => g.items.length)
+}
+
+export function counts(studios) {
+  const contacted = studios.filter((s) => CONTACTED_FROM.includes(s.status)).length
+  return {
+    total: studios.length,
+    toContact: studios.filter((s) => s.status === 'to_contact').length,
+    contacted,
+    answered: studios.filter((s) => ['replied', 'interview', 'offer'].includes(s.status)).length,
+    messages: studios.reduce((n, s) => n + s.messages.length, 0),
+  }
+}
+
+/** The progress backup: every dated event of every studio, most recent first. */
+export function timeline(studios, limit = 60) {
+  const out = []
+  for (const s of studios) {
+    for (const m of s.messages) out.push({ at: m.at, studio: s.name, id: s.id, kind: 'message', label: `message envoyé (${m.channel})`, text: m.text })
+    for (const h of s.history) out.push({ at: h.at, studio: s.name, id: s.id, kind: 'status', label: `${statusLabel(h.from)} → ${statusLabel(h.to)}`, text: h.note })
+  }
+  return out.sort((a, b) => String(b.at).localeCompare(String(a.at))).slice(0, limit)
+}
+
+/** Search on what the eye looks for: the studio, the role, the city, the text already sent. */
+export function searchStudios(studios, query) {
+  const q = String(query || '').trim().toLowerCase()
+  if (!q) return studios
+  return studios.filter((s) => [s.name, s.role, s.city, s.notes, ...s.messages.map((m) => m.text)].join(' ').toLowerCase().includes(q))
+}

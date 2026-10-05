@@ -1,0 +1,42 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+function indexedDbWith(record) {
+  return {
+    open() {
+      const request = {}
+      queueMicrotask(() => {
+        request.result = {
+          objectStoreNames: { contains: () => true },
+          transaction: () => ({
+            objectStore: () => ({
+              get: () => {
+                const getRequest = {}
+                queueMicrotask(() => { getRequest.result = record; getRequest.onsuccess?.() })
+                return getRequest
+              },
+            }),
+          }),
+        }
+        request.onsuccess?.()
+      })
+      return request
+    },
+  }
+}
+
+describe('index de recherche stale-while-revalidate', () => {
+  afterEach(() => { vi.unstubAllGlobals(); vi.resetModules() })
+
+  it('rend IndexedDB sans attendre le réseau de rafraîchissement', async () => {
+    vi.stubGlobal('indexedDB', indexedDbWith({ builtAt: 'cached', paths: ['pages/a.plan.json'], thumbs: {}, content: {} }))
+    let releaseNetwork
+    vi.stubGlobal('fetch', vi.fn(() => new Promise((resolve) => { releaseNetwork = () => resolve({ ok: false }) })))
+    const { loadSearchIndex } = await import('./searchIndexClient.js')
+    const result = await Promise.race([
+      loadSearchIndex(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('réseau attendu à tort')), 100)),
+    ])
+    expect(result.paths).toEqual(['pages/a.plan.json'])
+    releaseNetwork()
+  })
+})

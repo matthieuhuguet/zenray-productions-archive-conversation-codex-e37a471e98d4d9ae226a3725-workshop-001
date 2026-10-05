@@ -1,0 +1,14 @@
+import { describe, expect, it } from 'vitest'
+import { getIndexPaths, injectSearchIndexPaths, loadSearchIndex, rollbackSearchIndexPaths } from './searchIndexClient.js'
+
+describe('optimistic Eagle placement index', () => {
+  it('rend le placement cherchable immédiatement et sait annuler un lot atomique', async () => {
+    const paths = ['pages/Projet/dragon.hda.file.json', 'pages/Projet/music.media.json']
+    injectSearchIndexPaths(paths)
+    expect(getIndexPaths()).toEqual(expect.arrayContaining(paths))
+    expect((await loadSearchIndex()).paths).toEqual(expect.arrayContaining(paths))
+
+    rollbackSearchIndexPaths(paths)
+    expect(getIndexPaths()).not.toEqual(expect.arrayContaining(paths))
+  })
+})

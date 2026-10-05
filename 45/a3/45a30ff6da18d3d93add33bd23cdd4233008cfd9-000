@@ -1,0 +1,3 @@
+// 4 October 2026, 10:00 CEST: catalog and reader refresh parameters have one definition.
+export const CONVERSATION_SETTINGS = { metadataBytes: 65536, windowBytes: 2097152, refreshMs: 10000, collapsedPromptCharacters: 900 }
+export const CONVERSATION_PROVIDERS = { claude: 'Claude', codex: 'Codex / GPT', gemini: 'Gemini / Google' }
