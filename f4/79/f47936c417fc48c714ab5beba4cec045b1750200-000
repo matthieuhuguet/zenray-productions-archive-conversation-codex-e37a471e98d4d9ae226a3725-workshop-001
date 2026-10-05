@@ -1,0 +1,66 @@
+// 2 October 2026, 20:10 CEST: implementation changes require a fresh canonical skill revision before recording proof.
+import { readFile, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
+import path from 'node:path'
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
+const contractOption = process.argv.find((value) => value.startsWith('--contract='))
+const contractPath = contractOption ? path.resolve(contractOption.slice('--contract='.length)) : path.join(root, 'scripts/Assets/SkillContract.json')
+const skillPath = path.join(process.env.HOME, '.claude/skills/zenray-assets-v2/SKILL.md')
+const hash = (bytes) => createHash('sha256').update(bytes).digest('hex')
+let contract
+try { contract = JSON.parse(await readFile(contractPath, 'utf8')) }
+catch (error) { if (error.code !== 'ENOENT') throw error }
+const record = process.argv.includes('--record')
+// 3 October 2026, 03:48 CEST: required files stay covered when an older recorded contract predates their addition.
+const requiredFiles = [
+  'scripts/AssetsService.mjs', 'scripts/AssetsCloudPublisher.mjs', 'scripts/AssetsConfig.json',
+  'scripts/AssetsFeedbackCapture.mjs',
+  // 4 October 2026, 10:05 CEST: native conversation indexing and decoding stay covered by the current skill.
+  'scripts/Assets/ConversationCatalog.mjs', 'scripts/Assets/ReadGeminiConversation.py', 'scripts/Assets/AntigravitySchema.json',
+  'scripts/Assets/ConversationMirror.mjs',
+  'src/components/assets/ConversationView.jsx', 'src/lib/assetsConversations.js', 'src/lib/assetsConversationArchives.js',
+  // 3 October 2026, 16:23 CEST: the mandatory conversation entrypoint is part of the implementation contract.
+  'scripts/Assets/BeginConversation.mjs', 'scripts/Assets/ConversationIdentity.mjs', 'scripts/Assets/BridgeClient.mjs',
+  // 3 October 2026, 15:17 CEST: cover every new file view, filter and identity module.
+  // 3 October 2026, 15:52 CEST: the shared frame styles govern the Assets sidebar union.
+  'src/fonts.css',
+  'scripts/AssetsHistory.mjs', 'src/lib/assetsFileQuery.js',
+  'src/components/assets/ProjectIdentity.jsx', 'src/components/assets/LocationPath.jsx',
+  'src/components/assets/FileFilters.jsx', 'src/components/assets/FilePresentations.jsx',
+  'src/components/assets/AssetsWorkspace.tokens.css', 'src/components/assets/AssetsDesignControls.jsx',
+  'scripts/Assets/AuditHoudiniScene.py',
+  'scripts/Assets/PrepareHoudiniScene.py',
+  'scripts/Assets/SceneAuditRunner.mjs',
+  'scripts/local-server.mjs',
+  'scripts/AssetsWorkspaceLifecycle.mjs', 'scripts/Assets/BeginProject.mjs', 'scripts/Assets/Client.mjs',
+  // 3 October 2026, 16:34 CEST: recent activity ordering survives the local/cloud merge.
+  // 3 October 2026, 21:52 CEST: the storage diagram and byte attribution share the current skill contract.
+  'src/lib/assetsStorageBreakdown.js', 'src/components/assets/StorageBreakdown.jsx',
+  // 3 October 2026, 22:20 CEST: both file locations and the optional media details slot are covered.
+  'src/lib/assetsFileLocations.js', 'src/components/assets/FileLocations.jsx', 'src/components/QuickLookOverlay.jsx',
+  'src/lib/assetsProjects.js', 'src/lib/assetsWorkspaceViewModel.js',
+  'src/lib/projectContextIndex.js', 'src/lib/projectWorkspace.js', 'src/lib/projectPreview.js',
+  'src/lib/sceneReferenceMapping.js',
+  'src/lib/scenePreparation.js',
+  'src/components/assets/AssetsWorkspaceView.jsx', 'src/components/assets/ProjectWorkspace.jsx',
+  'src/components/assets/ProjectWorkspace.css', 'Cloud/electron/watcher.ts',
+  'Cloud/scripts/restaurer.mjs', 'src/lib/archiveChunks.js', 'scripts/Assets/CheckSkillContract.mjs',
+  'Cloud/scripts/lib/safe-restore.mjs',
+]
+const files = [...new Set([...requiredFiles, ...Object.keys(contract?.files || {})])]
+const current = Object.fromEntries(await Promise.all(files.map(async (file) => [file, hash(await readFile(path.join(root, file)))])))
+const skillSha256 = hash(await readFile(skillPath))
+const changed = files.filter((file) => current[file] !== contract?.files[file])
+if (record) {
+  if (contract && changed.length && contract.skillSha256 === skillSha256) throw new Error('Implementation changed: append the verified change to the canonical zenray-assets-v2 skill before recording this contract')
+  const next = { schemaVersion: 1, recordedAt: new Date().toISOString(), skillSha256, files: current }
+  await writeFile(contractPath, `${JSON.stringify(next, null, 2)}\n`)
+  console.log(JSON.stringify({ recorded: true, files: files.length, skillSha256 }))
+} else {
+  const skillChanged = contract?.skillSha256 !== skillSha256
+  const ok = !!contract && !changed.length && !skillChanged
+  console.log(JSON.stringify({ ok, changedFiles: changed, skillChanged, recordedAt: contract?.recordedAt || null }))
+  if (!ok) process.exitCode = 1
+}

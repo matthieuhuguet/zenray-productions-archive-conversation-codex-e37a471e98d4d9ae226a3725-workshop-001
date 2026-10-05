@@ -1,0 +1,31 @@
+// 3 October 2026, 16:05 CEST: every agent conversation can begin with a mapped, watched workspace.
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
+import { config, requestAssets } from './BridgeClient.mjs'
+import { conversationStart } from './ConversationIdentity.mjs'
+
+try {
+  const allowed = ['agent', 'session-id', 'project-id', 'name']
+  const parameters = Object.fromEntries(process.argv.slice(2).map((option) => {
+    const match = option.match(/^--([^=]+)=(.+)$/)
+    if (!match || !allowed.includes(match[1])) throw new Error('Use --agent=<agent> --session-id=<actual-id> [--project-id=<existing-id>] [--name=<subject>]')
+    return [match[1], match[2]]
+  }))
+  const sessionId = parameters['session-id'] || process.env.CODEX_SESSION_ID || process.env.CODEX_THREAD_ID || process.env.CLAUDE_SESSION_ID || process.env.ANTIGRAVITY_CONVERSATION_ID || process.env.GEMINI_SESSION_ID
+  let bindings = {}
+  try { bindings = JSON.parse(await readFile(path.join(config.storage.stateDir, 'SessionBindings.json'), 'utf8')) }
+  catch (error) { if (error.code !== 'ENOENT') throw error }
+  const payload = conversationStart({ agent: parameters.agent, sessionId, projectId: parameters['project-id'], name: parameters.name }, bindings)
+  let result
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try { result = await requestAssets(payload); break }
+    catch (error) {
+      if (!error.message.includes('Transcript capture is active') || attempt === 2) throw error
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+    }
+  }
+  console.log(JSON.stringify({ projectId: result.project.id, name: result.project.name, ...result.setup, conversation: { agent: parameters.agent, sessionId, nativeCaptureSupported: ['claude', 'codex'].includes(parameters.agent) }, backupConfirmed: false }, null, 2))
+} catch (error) {
+  console.error(`Conversation initialization failed: ${error.message}. No verified cloud backup is claimed.`)
+  process.exitCode = 1
+}
